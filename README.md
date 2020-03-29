@@ -7,3 +7,7 @@ This is the Tensorflow version of @julien-c [trainer proposal](https://github.co
 ## Architecture
 
 ## Installation and usage
+The requirements to run the examples are:
+```
+pip install tensorflow tensorflow_datasets transformers
+```
