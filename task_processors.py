@@ -3,12 +3,17 @@
 
 import logging
 from abc import ABC, abstractmethod
+from typing import Dict, List, Union
 
 from tfds import SequenceClassification
 import tensorflow_datasets as tfds
+import tensorflow as tf
+
+from torch.utils.data.dataset import TensorDataset
 
 from transformers import is_tf_available, is_torch_available
 from transformers import InputExample, InputFeatures
+from transformers import PreTrainedTokenizer
 
 
 logger = logging.getLogger(__name__)
@@ -17,23 +22,31 @@ logger = logging.getLogger(__name__)
 class DataProcessor(ABC):
     """Base class for data converters for sequence classification data sets."""
     def __init__(self, **config):
-        self.examples = {}
+        self.examples: Dict[str, List[InputExample]] = {}
         self.examples["train"] = []
         self.examples["validation"] = []
         self.examples["test"] = []
-        self.files = {}
+        self.files: Dict[str, str] = {}
         self.files["train"] = config.pop("train_file", None)
         self.files["validation"] = config.pop("dev_file", None)
         self.files["test"] = config.pop("test_file", None)
-        self.ds = None
-        self.info = None
+        self.ds: tf.data.Dataset
+        self.info: tfds.core.DatasetInfo
 
         assert len(config) == 0, "unrecognized params passed: %s" % ",".join(config.keys())
 
-    def num_examples(self, mode):
+    def num_examples(self, mode: str) -> int:
+        """
+        Return the number of examples of a given split.
+        Args:
+          mode: the "train", "validation" or "test" split.
+        """
         return self.info.splits[mode].num_examples
 
     def create_examples(self):
+        """
+        Create the examples from a Tensorflow dataset.
+        """
         for mode in ["train", "validation", "test"]:
             tf_dataset = self.ds[mode]
 
@@ -46,25 +59,30 @@ class DataProcessor(ABC):
                 self.examples[mode].append(example)
 
     @abstractmethod
-    def get_example_from_tensor_dict(self, tensor_dict, id):
+    def get_example_from_tensor_dict(self, tensor_dict: tf.Tensor, id: int) -> InputExample:
+        """
+        Get an example from a dict with tensorflow tensors
+        Args:
+          tensor_dict: Keys and values should match the corresponding tensorflow dataset features.
+        """
         pass
 
     @abstractmethod
-    def convert_examples_to_features(self, mode, tokenizer, max_len, return_dataset="tf"):
+    def convert_examples_to_features(self, mode: str, tokenizer: PreTrainedTokenizer, max_len: int, return_dataset: str = "tf") -> Union[tf.data.Dataset, TensorDataset]:
         pass
 
 
 class DataProcessorForSequenceClassification(DataProcessor):
     def __init__(self, **config):
-        self.guid = config.pop("guid", "guid")
-        self.text_a = config.pop("text_a", "text_a")
-        self.text_b = config.pop("text_b", "text_b")
-        self.label = config.pop("label", "label")
-        self.dataset_name = config.pop("dataset_name", None)
-        self.is_column_id = config.pop("is_column_id", False)
-        self.skip_first_row = config.pop("skip_first_row", False)
-        self.delimiter = config.pop("delimiter", "\t")
-        self.quotechar = config.pop("quotechar", "\"")        
+        self.guid: str = config.pop("guid", "guid")
+        self.text_a: str = config.pop("text_a", "text_a")
+        self.text_b: str = config.pop("text_b", "text_b")
+        self.label: str = config.pop("label", "label")
+        self.dataset_name: str = config.pop("dataset_name", None)
+        self.is_column_id: bool = config.pop("is_column_id", False)
+        self.skip_first_row: bool = config.pop("skip_first_row", False)
+        self.delimiter: str = config.pop("delimiter", "\t")
+        self.quotechar: str = config.pop("quotechar", "\"")        
         super().__init__(**config)
 
         if self.dataset_name.split("/")[0] in tfds.list_builders():
@@ -87,11 +105,11 @@ class DataProcessorForSequenceClassification(DataProcessor):
         if self.label not in list(self.info.features.keys()):
             raise ValueError("The feature name " + self.label + " doesn't exists in " + list(self.info.features.keys()))
 
-    def get_labels(self):
+    def get_labels(self) -> List[str]:
         """Gets the list of labels for this data set."""
         return self.info.features[self.label].names
 
-    def convert_examples_to_features(self, mode, tokenizer, max_len, return_dataset="tf"):
+    def convert_examples_to_features(self, mode: str, tokenizer: PreTrainedTokenizer, max_len: int, return_dataset: str = "tf") -> Union[tf.data.Dataset, TensorDataset]:
         if max_len is None:
             max_len = tokenizer.max_len
 
@@ -127,8 +145,6 @@ class DataProcessorForSequenceClassification(DataProcessor):
             if not is_tf_available():
                 raise RuntimeError("return_dataset set to 'tf' but TensorFlow 2.0 can't be imported")
 
-            import tensorflow as tf
-
             def gen():
                 for ex in features:
                     yield ({"input_ids": ex.input_ids, "attention_mask": ex.attention_mask, "token_type_ids": ex.token_type_ids}, ex.label)
@@ -145,7 +161,6 @@ class DataProcessorForSequenceClassification(DataProcessor):
                 raise RuntimeError("return_dataset set to 'pt' but PyTorch can't be imported")
 
             import torch
-            from torch.utils.data import TensorDataset
 
             all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
             all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
@@ -156,12 +171,7 @@ class DataProcessorForSequenceClassification(DataProcessor):
         else:
             raise ValueError("return_tensors should be one of 'tf' or 'pt'")
 
-    def get_example_from_tensor_dict(self, tensor_dict, id):
-        """Get an example from a dict with tensorflow tensors
-        Args:
-            tensor_dict: Keys and values should match the corresponding Glue
-                tensorflow_dataset examples.
-        """
+    def get_example_from_tensor_dict(self, tensor_dict: tf.Tensor, id: int) -> InputExample:
         if self.guid in list(self.info.features.keys()):
             guid = tensor_dict[self.guid].numpy()
         else:

@@ -2,29 +2,30 @@
 """Data processors for Tensorflow datasets"""
 
 import csv
+from typing import Dict, List, Iterator, Union, ClassVar
 
 import tensorflow_datasets.public_api as tfds
 import tensorflow as tf
 
 
 class SequenceClassification(tfds.core.GeneratorBasedBuilder):
-    VERSION = tfds.core.Version(
+    VERSION: ClassVar[tfds.core.Version] = tfds.core.Version(
         "1.0.0", "Sequence Classification dataset builder",
         experiments={tfds.core.Experiment.S3: False})
 
     def __init__(self, **config):
-        self.name = config.pop("dataset_name", None)
-        self.files = {}
+        self.name: str = config.pop("dataset_name", None)
+        self.files: Dict[str, str] = {}
         self.files["train"] = config.pop("train_file", None)
         self.files["dev"] = config.pop("dev_file", None)
         self.files["test"] = config.pop("test_file", None)
-        self.is_column_id = config.pop("is_column_id", False)
-        self.skip_first_row = config.pop("skip_first_row", False)
-        self.delimiter = config.pop("delimiter", "\t")
-        self.quotechar = config.pop("quotechar", "\"")
+        self.is_column_id: bool = config.pop("is_column_id", False)
+        self.skip_first_row: bool = config.pop("skip_first_row", False)
+        self.delimiter: str = config.pop("delimiter", "\t")
+        self.quotechar: str = config.pop("quotechar", "\"")
         super(SequenceClassification, self).__init__(**config)
 
-    def _info(self):
+    def _info(self) -> tfds.core.DatasetInfo:
         features = {
             "guid": tf.int32,
             "text_a": tfds.features.Text(),
@@ -38,7 +39,7 @@ class SequenceClassification(tfds.core.GeneratorBasedBuilder):
             features=tfds.features.FeaturesDict(features),
         )
 
-    def _split_generators(self, dl_manager):
+    def _split_generators(self, dl_manager: tfds.download.DownloadManager) -> List[tfds.core.SplitGenerator]:
         labels = set()
 
         for split in ["train", "dev", "test"]:
@@ -68,7 +69,7 @@ class SequenceClassification(tfds.core.GeneratorBasedBuilder):
             ),
         ]
 
-    def _generate_examples(self, split):
+    def _generate_examples(self, split: str) -> Iterator[Union[int, Dict[str, str]]]:
         if not self.files[split]:
             return None, {}
 

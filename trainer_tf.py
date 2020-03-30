@@ -7,6 +7,7 @@ from collections import OrderedDict
 import math
 import itertools
 from abc import ABC, abstractmethod
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 
@@ -16,8 +17,8 @@ import tensorflow as tf
 from transformers import WarmUp, AdamWeightDecay
 from transformers import AutoConfig
 from transformers import AutoTokenizer
-from task_processors import DataProcessorForSequenceClassification
-from transformers import TFAutoModelForSequenceClassification
+from task_processors import DataProcessor, DataProcessorForSequenceClassification
+from transformers import TFAutoModelForSequenceClassification, TFPreTrainedModel
 
 
 logger = logging.getLogger(__name__)
@@ -29,24 +30,24 @@ class TFTrainer(ABC):
         The list of keys in kwargs here should be generic to all the possible models/architectures
         and not specific to such or such dataset/task.
         """
-        self.pretrained_model_name_or_path = kwargs.pop("pretrained_model_name_or_path", None)
-        self.optimizer_name = kwargs.pop("optimizer_name", None)
-        self.warmup_steps = kwargs.pop("warmup_steps", None)
-        self.decay_steps = kwargs.pop("decay_steps", None)
-        self.learning_rate = kwargs.pop("learning_rate", None)
-        self.adam_epsilon = kwargs.pop("adam_epsilon", 1e-08)
-        self.loss_name = kwargs.pop("loss_name", None)
-        self.train_batch_size = kwargs.pop("train_batch_size", None)
-        self.eval_batch_size = kwargs.pop("eval_batch_size", None)
-        self.distributed = kwargs.pop("distributed", None)
-        self.epochs = kwargs.pop("epochs", None)
-        self.max_grad_norm = kwargs.pop("max_grad_norm", 1.0)
-        self.metric_name = kwargs.pop("metric_name", None)
-        self.max_len = kwargs.pop("max_len", None)
-        self.task = kwargs.pop("task", None)
-        self.datasets = {}
-        self.processor = None
-        self.model_class = None
+        self.pretrained_model_name_or_path: str = kwargs.pop("pretrained_model_name_or_path", None)
+        self.optimizer_name: str = kwargs.pop("optimizer_name", None)
+        self.warmup_steps: int = kwargs.pop("warmup_steps", None)
+        self.decay_steps: int = kwargs.pop("decay_steps", None)
+        self.learning_rate: float = kwargs.pop("learning_rate", None)
+        self.adam_epsilon: float = kwargs.pop("adam_epsilon", 1e-08)
+        self.loss_name: str = kwargs.pop("loss_name", None)
+        self.train_batch_size: int = kwargs.pop("train_batch_size", None)
+        self.eval_batch_size: int = kwargs.pop("eval_batch_size", None)
+        self.distributed: bool = kwargs.pop("distributed", None)
+        self.epochs: int = kwargs.pop("epochs", None)
+        self.max_grad_norm: float = kwargs.pop("max_grad_norm", 1.0)
+        self.metric_name: str = kwargs.pop("metric_name", None)
+        self.max_len: int = kwargs.pop("max_len", None)
+        self.task: str = kwargs.pop("task", None)
+        self.datasets: Dict[str, tf.data.Dataset] = {}
+        self.processor: DataProcessor
+        self.model_class: TFPreTrainedModel
 
         if self.distributed:
             self.strategy = tf.distribute.MirroredStrategy()
@@ -60,7 +61,7 @@ class TFTrainer(ABC):
 
         assert len(kwargs) == 0, "unrecognized params passed: %s" % ",".join(kwargs.keys())
 
-    def setup_training(self, checkpoint_path="checkpoints", log_path="logs", data_cache_dir="cache", model_cache_dir=None):
+    def setup_training(self, checkpoint_path: str = "checkpoints", log_path: str = "logs", data_cache_dir: str = "cache", model_cache_dir: Optional[str] = None) -> None:
         """
         Setup the different steps to train a model:
           - check if all the data are given
@@ -69,12 +70,10 @@ class TFTrainer(ABC):
           - prepare the model settings
 
         Args:
-          checkpoint_path: the directory path where the model checkpoints will be saved.
-          log_path: the directory path where the Tensorboard logs will be saved.
-          cache_dir (optional): the directory path where the pretrained model and data will be cached.
-            "./cache" folder by default.
-          data_dir (optional): the directoty path where the data are. This parameter becomes mandatory if
-            the parameters training_data and validation_data are not given.
+          checkpoint_path: the directory path where the model checkpoints will be saved, "./checkpoints" folder by default.
+          log_path: the directory path where the Tensorboard logs will be saved, "./logs" folder by default.
+          data_cache_dir: the directory path where the data will be cached, "./cache" folder by default.
+          model_cache_dir (optional): the directory path where the pretrained model will be cached.
         """
         self.tokenizer = AutoTokenizer.from_pretrained(self.pretrained_model_name_or_path, cache_dir=model_cache_dir, use_fast=True)
 
@@ -88,16 +87,19 @@ class TFTrainer(ABC):
             self._create_checkpoint_manager(checkpoint_path)
             self._create_summary_writer(log_path)
 
-    def _config_trainer(self, model_cache_dir):
+    def _config_trainer(self, model_cache_dir: Optional[str] = None) -> None:
         """
         This method set all the required fields for a specific task. For example
         in case of a classification set all the labels.
+        Args:
+          model_cache_dir (optional): the directory path where the pretrained model will be cached.
         """
         self.config = AutoConfig.from_pretrained(self.pretrained_model_name_or_path, cache_dir=model_cache_dir)
 
-    def _set_loss_and_metric(self):
+    def _set_loss_and_metric(self) -> None:
         """
-        Use the loss corresponding to the loss_name field.
+        Create the training loss and metric with their name. Allowed names are those listed
+        in the Tensorflow documentation and those contained in the transformers library.
         """
         try:
             self.loss = tf.keras.losses.get({"class_name": self.loss_name, "config": {"from_logits": True, "reduction": tf.keras.losses.Reduction.NONE}})
@@ -112,23 +114,25 @@ class TFTrainer(ABC):
 
         self.test_loss_metric = tf.keras.metrics.Mean(name='test_loss')
 
-    def _create_summary_writer(self, log_path):
+    def _create_summary_writer(self, log_path: str) -> None:
         """
         Create a summary writer to be able to read the logs in Tensorboard.
+        Args:
+          log_path: the directory path where the Tensorboard logs will be saved.
         """
         self.log_path = log_path
         self.train_writer = tf.summary.create_file_writer(log_path + "/train")
         self.test_writer = tf.summary.create_file_writer(log_path + "/test")
 
     @abstractmethod
-    def _create_features(self):
+    def _create_features(self) -> None:
         """
         Create the features for the training and validation data.
         """
         pass
 
     @abstractmethod
-    def _load_cache(self, cached_file):
+    def _load_cache(self, cached_file: str) -> tf.data.Dataset:
         """
         Load a cached TFRecords dataset.
         Args:
@@ -137,7 +141,7 @@ class TFTrainer(ABC):
         pass
 
     @abstractmethod
-    def _save_cache(self, mode, cached_file):
+    def _save_cache(self, mode: str, cached_file: str) -> None:
         """
         Save a cached TFRecords dataset.
         Args:
@@ -146,13 +150,11 @@ class TFTrainer(ABC):
         """
         pass
 
-    def _preprocess_data(self, cache_dir):
+    def _preprocess_data(self, cache_dir: str) -> None:
         """
         Preprocess the training and validation data.
         Args:
-          tokenizer: the tokenizer used for encoding the textual data into features.
-          data_dir: the directory path where the data are.
-          cache_dir: the directory path where the cached data are.
+          cache_dir: the directory path where the cached data are / should be saved.
         """
         cached_training_features_file = os.path.join(
             cache_dir, "cached_train_{}_{}_{}.tf_record".format(
@@ -197,14 +199,10 @@ class TFTrainer(ABC):
         self.test_steps = math.ceil(self.processor.num_examples("test") / (self.eval_batch_size / self.strategy.num_replicas_in_sync))
         self.datasets["test"] = self.datasets["test"].batch(self.eval_batch_size // self.strategy.num_replicas_in_sync)
 
-    def _create_optimizer(self):
+    def _create_optimizer(self) -> None:
         """
-        Create the training optimizer with its name. Allowed names:
-          - adam: Adam optimizer
-          - adamw: Adam with Weight decay optimizer
-          - adadelta: Adadelta optimizer
-          - rmsprop: Root Mean Square Propogation optimizer
-          - sgd: Stochastic Gradient Descent optimizer
+        Create the training optimizer with its name. Allowed names are those listed
+        in the Tensorflow documentation and those contained in the transformers library.
         """
         if self.optimizer_name == "adamw":
             if self.decay_steps is None:
@@ -226,13 +224,13 @@ class TFTrainer(ABC):
                 # This is for the case where the optimizer is not Adam-like such as SGD
                 self.optimizer = tf.keras.optimizers.get({"class_name": self.optimizer_name, "config" : {"learning_rate": self.learning_rate}})
 
-    def _create_checkpoint_manager(self, checkpoint_path, max_to_keep=5, load_model=True):
+    def _create_checkpoint_manager(self, checkpoint_path: str, max_to_keep: int = 5, load_model: bool = True) -> None:
         """
         Create a checkpoint manager in order to be able to make the training
         fault-tolerant.
         Args:
-          max_to_keep: the maximum number of checkpoints to keep in the
-            checkpoint path.
+          checkpoint_path: the directory path where the model checkpoints will be saved.
+          max_to_keep: the maximum number of checkpoints to keep in the checkpoint path.
           load_model: if we want to start the training from the latest checkpoint.
         """
         ckpt = tf.train.Checkpoint(optimizer=self.optimizer, model=self.model)
@@ -241,7 +239,7 @@ class TFTrainer(ABC):
         if load_model:
             ckpt.restore(self.model.ckpt_manager.latest_checkpoint)
 
-    def _evaluate_during_training(self):
+    def _evaluate_during_training(self) -> None:
         """
         Evaluate the model during the training at the end of each epoch.
         """
@@ -261,7 +259,7 @@ class TFTrainer(ABC):
 
             test_step += 1
 
-    def train(self):
+    def train(self) -> None:
         """
         Train method to train the model.
         """
@@ -311,7 +309,7 @@ class TFTrainer(ABC):
                 self.test_acc_metric.reset_states()
 
     @abstractmethod
-    def _distributed_test_step(self, dist_inputs):
+    def _distributed_test_step(self, dist_inputs: Tuple[Dict[str, tf.Tensor], tf.Tensor]) -> None:
         """
         Method that represents a custom test step in distributed mode
         Args:
@@ -320,7 +318,7 @@ class TFTrainer(ABC):
         pass
 
     @abstractmethod
-    def _distributed_train_step(self, dist_inputs):
+    def _distributed_train_step(self, dist_inputs: Tuple[Dict[str, tf.Tensor], tf.Tensor]) -> float:
         """
         Method that represents a custom training step in distributed mode.
         Args:
@@ -329,13 +327,13 @@ class TFTrainer(ABC):
         pass
 
     @abstractmethod
-    def evaluate(self):
+    def evaluate(self) -> None:
         """
         Evaluate the model over the test dataset and print a report.
         """
         pass
 
-    def save_model(self, save_path):
+    def save_model(self, save_path: str) -> None:
         """
         Save the pretrained model and create a Tensorflow saved model.
         Args:
@@ -365,9 +363,9 @@ class TFTrainerForSequenceClassification(TFTrainer):
         super().__init__(**model_config)
         self.processor = DataProcessorForSequenceClassification(**data_processor_config)
         self.model_class = TFAutoModelForSequenceClassification
-        self.labels = []
+        self.labels: List[str] = []
 
-    def _create_features(self):
+    def _create_features(self) -> None:
         self.datasets["train"] = self.processor.convert_examples_to_features("train", self.tokenizer, self.max_len, return_dataset="tf")
         self.datasets["validation"] = self.processor.convert_examples_to_features("validation", self.tokenizer, self.max_len, return_dataset="tf")
         self.datasets["test"] = self.processor.convert_examples_to_features("test", self.tokenizer, self.max_len, return_dataset="tf")
@@ -375,19 +373,19 @@ class TFTrainerForSequenceClassification(TFTrainer):
         if self.datasets["test"] is None:
             self.datasets["test"] = self.datasets["validation"]
 
-    def get_labels(self):
+    def get_labels(self) -> List[str]:
         """
         Returns the list of labels associated to the trained model.
         """
         return self.labels
 
-    def _config_trainer(self, model_cache_dir):
+    def _config_trainer(self, model_cache_dir: str) -> None:
         self.labels = self.processor.get_labels()
         self.label2id = {label: i for i, label in enumerate(self.labels)}
         self.id2label = {i: label for i, label in enumerate(self.labels)}
         self.config = AutoConfig.from_pretrained(self.pretrained_model_name_or_path, num_labels=len(self.labels), id2label=self.id2label, label2id=self.label2id, cache_dir=model_cache_dir)
 
-    def _load_cache(self, cached_file):
+    def _load_cache(self, cached_file: str) -> tf.data.Dataset:
         name_to_features = {
             "input_ids": tf.io.FixedLenFeature([self.max_len], tf.int64),
             "attention_mask": tf.io.FixedLenFeature([self.max_len], tf.int64),
@@ -405,7 +403,7 @@ class TFTrainerForSequenceClassification(TFTrainer):
 
         return d
 
-    def _save_cache(self, mode, cached_file):
+    def _save_cache(self, mode: str, cached_file: str) -> None:
         writer = tf.io.TFRecordWriter(cached_file)
         ds = self.datasets[mode].enumerate()
 
@@ -434,7 +432,7 @@ class TFTrainerForSequenceClassification(TFTrainer):
         writer.close()
 
     @tf.function
-    def _distributed_test_step(self, dist_inputs):
+    def _distributed_test_step(self, dist_inputs: Tuple[Dict[str, tf.Tensor], tf.Tensor]) -> None:
         def step_fn(inputs):
             features, labels = inputs
             logits = self.model(features, training=False)
@@ -446,7 +444,7 @@ class TFTrainerForSequenceClassification(TFTrainer):
         self.strategy.experimental_run_v2(step_fn, args=(dist_inputs,))
 
     @tf.function
-    def _distributed_train_step(self, dist_inputs):
+    def _distributed_train_step(self, dist_inputs: Tuple[Dict[str, tf.Tensor], tf.Tensor]) -> float:
         def step_fn(inputs):
             features, labels = inputs
 
@@ -472,7 +470,7 @@ class TFTrainerForSequenceClassification(TFTrainer):
 
         return sum_loss
 
-    def evaluate(self):
+    def evaluate(self) -> None:
         y_true = []
         results = self.model.predict(self.datasets["test"], steps=self.test_steps)
 
