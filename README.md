@@ -10,8 +10,8 @@ The trainer itself is an abstract class that will contain methods that can be sh
 
 * `pretrained_model_name_or_path`: path/name of the pretrained model.
 * `optimizer_name`: name of the optimizer we want to use. All these available in Tensorflow's Keras [list](https://www.tensorflow.org/api_docs/python/tf/keras/optimizers?hl=en) including those available in the transformers lib (for now only `AdamW`).
-* `warmup_steps`: the number of warmup steps for the `AdamW` scheduler. 
-* `decay_steps`: the number of decay steps for the `AdamW` scheduler.
+* `warmup_steps`: the number of warmup steps for the `WarmUp` scheduler. 
+* `decay_steps`: the number of decay steps for the `PolynomialDecay` scheduler.
 * `learning_rate`: learning rate value used by the optimizer. 
 * `adam_epsilon`: epsilon value used by the Adam-like optimizers and RMSProp. (optional)
 * `loss_name`: name of the loss we want to use. All these available in Tensorflow's Keras [list](https://www.tensorflow.org/api_docs/python/tf/keras/losses?hl=en) including those available in the transformers lib (for now none)
