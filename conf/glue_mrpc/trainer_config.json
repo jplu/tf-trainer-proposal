@@ -1,0 +1,21 @@
+{
+    "pretrained_model_name_or_path": "bert-base-cased",
+    "optimizer_name": "adam",
+    "learning_rate": 3e-5,
+    "loss_name": "SparseCategoricalCrossentropy",
+    "train_batch_size": 16,
+    "eval_batch_size": 32,
+    "strategy_name": "onedevice",
+    "epochs": 4,
+    "metric_name": "SparseCategoricalAccuracy",
+    "max_len": 128,
+    "task": "glue/mrpc",
+    "data_processor": {
+        "dataset_name": "glue/mrpc",
+        "format": "tfds",
+        "guid": "idx",
+        "text_a": "sentence1",
+        "text_b": "sentence2",
+        "label": "label"
+    }
+}

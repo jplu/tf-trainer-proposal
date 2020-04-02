@@ -17,49 +17,51 @@ import tensorflow as tf
 from transformers import WarmUp, AdamWeightDecay
 from transformers import AutoConfig
 from transformers import AutoTokenizer
-from task_processors import DataProcessor, DataProcessorForSequenceClassification
 from transformers import TFAutoModelForSequenceClassification, TFPreTrainedModel
 
+from data_processors import DataProcessor, DataProcessorForSequenceClassification, DatasetInfo
+from configuration_trainer import TrainerConfig
 
 logger = logging.getLogger(__name__)
 
 
 class TFTrainer(ABC):
-    def __init__(self, **kwargs):
+    def __init__(self, config_path: str = None, config: TrainerConfig = None, **kwargs):
         """
         The list of keys in kwargs here should be generic to all the possible models/architectures
         and not specific to such or such dataset/task.
         """
-        self.pretrained_model_name_or_path: str = kwargs.pop("pretrained_model_name_or_path", None)
-        self.optimizer_name: str = kwargs.pop("optimizer_name", None)
-        self.warmup_steps: int = kwargs.pop("warmup_steps", None)
-        self.decay_steps: int = kwargs.pop("decay_steps", None)
-        self.learning_rate: float = kwargs.pop("learning_rate", None)
-        self.adam_epsilon: float = kwargs.pop("adam_epsilon", 1e-08)
-        self.loss_name: str = kwargs.pop("loss_name", None)
-        self.train_batch_size: int = kwargs.pop("train_batch_size", None)
-        self.eval_batch_size: int = kwargs.pop("eval_batch_size", None)
-        self.distributed: bool = kwargs.pop("distributed", None)
-        self.epochs: int = kwargs.pop("epochs", None)
-        self.max_grad_norm: float = kwargs.pop("max_grad_norm", 1.0)
-        self.metric_name: str = kwargs.pop("metric_name", None)
-        self.max_len: int = kwargs.pop("max_len", None)
-        self.task: str = kwargs.pop("task", None)
+        if config and not config_path:
+            if not isinstance(config, TrainerConfig):
+                raise ValueError(
+                    "Parameter config in `{}(config)` should be an instance of class `PretrainedConfig`. ".format(
+                        self.__class__.__name__)
+                )
+                self.config = config
+        elif config_path and not config:
+            self.config, unused_kwargs = TrainerConfig.from_trainer(config_path, return_unused_kwargs=True, return_unused_config=True, **kwargs)
+        else:
+            raise ValueError("the config_path and config parameters cannot be both filled or None.")
+
+        self.strategy_name: bool = unused_kwargs.pop("strategy_name", "onedevice")
+        self.data_processor_config: Dict = unused_kwargs.pop("data_processor", None)
+
+        assert len(unused_kwargs) == 0, "unrecognized params passed: %s" % ",".join(unused_kwargs.keys())
+
         self.datasets: Dict[str, tf.data.Dataset] = {}
         self.processor: DataProcessor
         self.model_class: TFPreTrainedModel
+        self.dataset_info: DatasetInfo
 
-        if self.distributed:
+        if self.strategy_name == "mirrored":
             self.strategy = tf.distribute.MirroredStrategy()
-            self.train_batch_size *= self.strategy.num_replicas_in_sync
-            self.eval_batch_size *= self.strategy.num_replicas_in_sync
-        else:
+        elif self.strategy_name == "onedevice":
             if len(tf.config.list_physical_devices('GPU')) >= 1:
                 self.strategy = tf.distribute.OneDeviceStrategy(device="/gpu:0")
             else:
                 self.strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0")
-
-        assert len(kwargs) == 0, "unrecognized params passed: %s" % ",".join(kwargs.keys())
+        else:
+            raise ValueError("The strategy {} does not exists.".format(self.strategy_name))
 
     def setup_training(self, checkpoint_path: str = "checkpoints", log_path: str = "logs", data_cache_dir: str = "cache", model_cache_dir: Optional[str] = None) -> None:
         """
@@ -75,13 +77,13 @@ class TFTrainer(ABC):
           data_cache_dir: the directory path where the data will be cached, "./cache" folder by default.
           model_cache_dir (optional): the directory path where the pretrained model will be cached.
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(self.pretrained_model_name_or_path, cache_dir=model_cache_dir, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.pretrained_model_name_or_path, cache_dir=model_cache_dir, use_fast=True)
 
         self._preprocess_data(data_cache_dir)
         self._config_trainer(model_cache_dir)
 
         with self.strategy.scope():
-            self.model = self.model_class.from_pretrained(self.pretrained_model_name_or_path, config=self.config, cache_dir=model_cache_dir)
+            self.model = self.model_class.from_pretrained(self.config.pretrained_model_name_or_path, config=self.model_config, cache_dir=model_cache_dir)
             self._create_optimizer()
             self._set_loss_and_metric()
             self._create_checkpoint_manager(checkpoint_path)
@@ -94,7 +96,7 @@ class TFTrainer(ABC):
         Args:
           model_cache_dir (optional): the directory path where the pretrained model will be cached.
         """
-        self.config = AutoConfig.from_pretrained(self.pretrained_model_name_or_path, cache_dir=model_cache_dir)
+        self.model_config = AutoConfig.from_pretrained(self.config.pretrained_model_name_or_path, cache_dir=model_cache_dir)
 
     def _set_loss_and_metric(self) -> None:
         """
@@ -102,15 +104,12 @@ class TFTrainer(ABC):
         in the Tensorflow documentation and those contained in the transformers library.
         """
         try:
-            self.loss = tf.keras.losses.get({"class_name": self.loss_name, "config": {"from_logits": True, "reduction": tf.keras.losses.Reduction.NONE}})
+            self.loss = tf.keras.losses.get({"class_name": self.config.loss_name, "config": {"from_logits": True, "reduction": tf.keras.losses.Reduction.NONE}})
         except TypeError:
-            self.loss = tf.keras.losses.get({"class_name": self.loss_name, "config": {"reduction": tf.keras.losses.Reduction.NONE}})
+            self.loss = tf.keras.losses.get({"class_name": self.config.loss_name, "config": {"reduction": tf.keras.losses.Reduction.NONE}})
 
-        if self.metric_name == "qa_metric":
-            pass
-        else:
-            self.train_acc_metric = tf.keras.metrics.get({"class_name": self.metric_name, "config": {"name": "train_accuracy"}})
-            self.test_acc_metric = tf.keras.metrics.get({"class_name": self.metric_name, "config": {"name": "test_accuracy"}})
+        self.train_acc_metric = tf.keras.metrics.get({"class_name": self.config.metric_name, "config": {"name": "train_accuracy"}})
+        self.test_acc_metric = tf.keras.metrics.get({"class_name": self.config.metric_name, "config": {"name": "test_accuracy"}})
 
         self.test_loss_metric = tf.keras.metrics.Mean(name='test_loss')
 
@@ -158,21 +157,22 @@ class TFTrainer(ABC):
         """
         cached_training_features_file = os.path.join(
             cache_dir, "cached_train_{}_{}_{}.tf_record".format(
-                self.task.replace("/", "-"), list(filter(None, self.pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len)
+                self.config.task.replace("/", "-"), list(filter(None, self.config.pretrained_model_name_or_path.split("/"))).pop(), str(self.config.max_len)
             ),
         )
         cached_validation_features_file = os.path.join(
             cache_dir, "cached_validation_{}_{}_{}.tf_record".format(
-                self.task.replace("/", "-"), list(filter(None, self.pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len)
+                self.config.task.replace("/", "-"), list(filter(None, self.config.pretrained_model_name_or_path.split("/"))).pop(), str(self.config.max_len)
             ),
         )
         cached_test_features_file = os.path.join(
             cache_dir, "cached_test_{}_{}_{}.tf_record".format(
-                self.task.replace("/", "-"), list(filter(None, self.pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len)
+                self.config.task.replace("/", "-"), list(filter(None, self.config.pretrained_model_name_or_path.split("/"))).pop(), str(self.config.max_len)
             ),
         )
 
         if os.path.exists(cached_training_features_file) and os.path.exists(cached_validation_features_file):
+            self.dataset_info = DatasetInfo.load(cache_dir)
             logger.info("Loading features from cached file %s", cached_training_features_file)
             self.datasets["train"] = self._load_cache(cached_training_features_file)
             logger.info("Loading features from cached file %s", cached_validation_features_file)
@@ -183,46 +183,48 @@ class TFTrainer(ABC):
             os.makedirs(cache_dir, exist_ok=True)
             self.processor.create_examples()
             self._create_features()
+            self.dataset_info = self.processor.datasetinfo()
             logger.info("Create cache file %s", cached_training_features_file)
             self._save_cache("train", cached_training_features_file)
             logger.info("Create cache file %s", cached_validation_features_file)
             self._save_cache("validation", cached_validation_features_file)
             logger.info("Create cache file %s", cached_test_features_file)
             self._save_cache("test", cached_test_features_file)
+            self.dataset_info.save(cache_dir)
 
-        self.train_steps = math.ceil(self.processor.num_examples("train") / self.train_batch_size)
-        self.datasets["train"] = self.datasets["train"].shuffle(128).batch(self.train_batch_size).repeat(-1)
+        train_batch = self.config.train_batch_size * self.strategy.num_replicas_in_sync
+        eval_batch = self.config.eval_batch_size * self.strategy.num_replicas_in_sync
+        test_batch = self.config.eval_batch_size
+        self.train_steps = math.ceil(self.dataset_info.sizes["train"] / train_batch)
+        self.datasets["train"] = self.datasets["train"].shuffle(128).batch(train_batch).repeat(-1)
         self.datasets["train"] = self.strategy.experimental_distribute_dataset(self.datasets["train"])
-        self.validation_steps = math.ceil(self.processor.num_examples("validation") / self.eval_batch_size)
-        self.datasets["validation"] = self.datasets["validation"].batch(self.eval_batch_size)
+        self.validation_steps = math.ceil(self.dataset_info.sizes["validation"] / eval_batch)
+        self.datasets["validation"] = self.datasets["validation"].batch(eval_batch)
         self.datasets["validation"] = self.strategy.experimental_distribute_dataset(self.datasets["validation"])
-        self.test_steps = math.ceil(self.processor.num_examples("test") / (self.eval_batch_size / self.strategy.num_replicas_in_sync))
-        self.datasets["test"] = self.datasets["test"].batch(self.eval_batch_size // self.strategy.num_replicas_in_sync)
+        self.test_steps = math.ceil(self.dataset_info.sizes["test"] / test_batch)
+        self.datasets["test"] = self.datasets["test"].batch(test_batch)
 
     def _create_optimizer(self) -> None:
         """
         Create the training optimizer with its name. Allowed names are those listed
         in the Tensorflow documentation and those contained in the transformers library.
         """
-        if self.optimizer_name == "adamw":
-            if self.decay_steps is None:
-                self.decay_steps = self.train_steps
-
-            learning_rate_fn = tf.keras.optimizers.schedules.PolynomialDecay(initial_learning_rate=self.learning_rate,
-                                                                             decay_steps=self.decay_steps,
+        if self.config.optimizer_name == "adamw":
+            learning_rate_fn = tf.keras.optimizers.schedules.PolynomialDecay(initial_learning_rate=self.config.learning_rate,
+                                                                             decay_steps=self.train_steps,
                                                                              end_learning_rate=0.0)
-            if self.warmup_steps:
-                learning_rate_fn = WarmUp(initial_learning_rate=self.learning_rate, decay_schedule_fn=learning_rate_fn,
-                                          warmup_steps=self.warmup_steps)
+            if self.config.warmup_steps:
+                learning_rate_fn = WarmUp(initial_learning_rate=self.config.learning_rate, decay_schedule_fn=learning_rate_fn,
+                                          warmup_steps=self.config.warmup_steps)
 
-            self.optimizer = AdamWeightDecay(learning_rate=learning_rate_fn, weight_decay_rate=0.01, epsilon=self.adam_epsilon,
+            self.optimizer = AdamWeightDecay(learning_rate=learning_rate_fn, weight_decay_rate=0.01, epsilon=self.config.adam_epsilon,
                                              exclude_from_weight_decay=["layer_norm", "bias"])
         else:
             try:
-                self.optimizer = tf.keras.optimizers.get({"class_name": self.optimizer_name, "config" : {"learning_rate": self.learning_rate, "epsilon": self.adam_epsilon}})
+                self.optimizer = tf.keras.optimizers.get({"class_name": self.config.optimizer_name, "config" : {"learning_rate": self.config.learning_rate, "epsilon": self.config.adam_epsilon}})
             except TypeError:
                 # This is for the case where the optimizer is not Adam-like such as SGD
-                self.optimizer = tf.keras.optimizers.get({"class_name": self.optimizer_name, "config" : {"learning_rate": self.learning_rate}})
+                self.optimizer = tf.keras.optimizers.get({"class_name": self.config.optimizer_name, "config" : {"learning_rate": self.config.learning_rate}})
 
     def _create_checkpoint_manager(self, checkpoint_path: str, max_to_keep: int = 5, load_model: bool = True) -> None:
         """
@@ -268,7 +270,7 @@ class TFTrainer(ABC):
             step = 1
             train_loss = 0.0
 
-            for epoch in range(1, self.epochs + 1):
+            for epoch in range(1, self.config.epochs + 1):
                 total_loss = 0.0
                 num_batches = 0
 
@@ -347,28 +349,21 @@ class TFTrainer(ABC):
         os.makedirs(path, exist_ok=True)
         self.model.save_pretrained(save_path)
         self.tokenizer.save_pretrained(save_path)
+        self.config.save_trainer(save_path)
         tf.saved_model.save(self.model, path)
 
 
 class TFTrainerForSequenceClassification(TFTrainer):
-    def __init__(self, **config):
-        model_config = config.pop("model_config", None)
-        data_processor_config = config.pop("data_processor_config", None)
-
-        assert len(config) == 0, "unrecognized params passed: %s" % ",".join(config.keys())
-
-        if model_config is None or data_processor_config is None:
-            raise ValueError("the model_config and data_processor_config properties should not be empty from the configuration")
-
-        super().__init__(**model_config)
-        self.processor = DataProcessorForSequenceClassification(**data_processor_config)
+    def __init__(self, config_path: str = None, config: TrainerConfig = None, **kwargs):
+        super().__init__(config_path, config, **kwargs)
+        self.processor = DataProcessorForSequenceClassification(**self.data_processor_config)
         self.model_class = TFAutoModelForSequenceClassification
         self.labels: List[str] = []
 
     def _create_features(self) -> None:
-        self.datasets["train"] = self.processor.convert_examples_to_features("train", self.tokenizer, self.max_len, return_dataset="tf")
-        self.datasets["validation"] = self.processor.convert_examples_to_features("validation", self.tokenizer, self.max_len, return_dataset="tf")
-        self.datasets["test"] = self.processor.convert_examples_to_features("test", self.tokenizer, self.max_len, return_dataset="tf")
+        self.datasets["train"] = self.processor.convert_examples_to_features("train", self.tokenizer, self.config.max_len, return_dataset="tf")
+        self.datasets["validation"] = self.processor.convert_examples_to_features("validation", self.tokenizer, self.config.max_len, return_dataset="tf")
+        self.datasets["test"] = self.processor.convert_examples_to_features("test", self.tokenizer, self.config.max_len, return_dataset="tf")
 
         if self.datasets["test"] is None:
             self.datasets["test"] = self.datasets["validation"]
@@ -377,19 +372,19 @@ class TFTrainerForSequenceClassification(TFTrainer):
         """
         Returns the list of labels associated to the trained model.
         """
-        return self.labels
+        return self.dataset_info.labels
 
     def _config_trainer(self, model_cache_dir: str) -> None:
-        self.labels = self.processor.get_labels()
+        self.labels = self.dataset_info.labels
         self.label2id = {label: i for i, label in enumerate(self.labels)}
         self.id2label = {i: label for i, label in enumerate(self.labels)}
-        self.config = AutoConfig.from_pretrained(self.pretrained_model_name_or_path, num_labels=len(self.labels), id2label=self.id2label, label2id=self.label2id, cache_dir=model_cache_dir)
+        self.model_config = AutoConfig.from_pretrained(self.config.pretrained_model_name_or_path, num_labels=len(self.labels), id2label=self.id2label, label2id=self.label2id, cache_dir=model_cache_dir)
 
     def _load_cache(self, cached_file: str) -> tf.data.Dataset:
         name_to_features = {
-            "input_ids": tf.io.FixedLenFeature([self.max_len], tf.int64),
-            "attention_mask": tf.io.FixedLenFeature([self.max_len], tf.int64),
-            "token_type_ids": tf.io.FixedLenFeature([self.max_len], tf.int64),
+            "input_ids": tf.io.FixedLenFeature([self.config.max_len], tf.int64),
+            "attention_mask": tf.io.FixedLenFeature([self.config.max_len], tf.int64),
+            "token_type_ids": tf.io.FixedLenFeature([self.config.max_len], tf.int64),
             "label": tf.io.FixedLenFeature([1], tf.int64),
         }
 
@@ -451,14 +446,14 @@ class TFTrainerForSequenceClassification(TFTrainer):
             with tf.GradientTape() as tape:
                 logits = self.model(features, training=True)
                 per_example_loss = self.loss(labels, logits[0])
-                loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=self.train_batch_size)
+                loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=self.config.train_batch_size)
 
             gradients = tape.gradient(loss, self.model.trainable_variables)
 
-            if self.optimizer_name == "adamw":
-                self.optimizer.apply_gradients(list(zip(gradients, self.model.trainable_variables)), self.max_grad_norm)
+            if self.config.optimizer_name == "adamw":
+                self.optimizer.apply_gradients(list(zip(gradients, self.model.trainable_variables)), self.config.max_grad_norm)
             else:
-                gradients = [(tf.clip_by_value(grad, -self.max_grad_norm, self.max_grad_norm)) for grad in gradients]
+                gradients = [(tf.clip_by_value(grad, -self.config.max_grad_norm, self.config.max_grad_norm)) for grad in gradients]
                 self.optimizer.apply_gradients(list(zip(gradients, self.model.trainable_variables)))
 
             self.train_acc_metric(labels, logits[0])
