@@ -8,11 +8,11 @@
     "strategy_name": "onedevice",
     "epochs": 4,
     "metric_name": "SparseCategoricalAccuracy",
-    "max_len": 128,
     "task": "glue/mrpc",
     "data_processor": {
         "dataset_name": "glue/mrpc",
         "format": "tfds",
+        "max_len": 128,
         "guid": "idx",
         "text_a": "sentence1",
         "text_b": "sentence2",

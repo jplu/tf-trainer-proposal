@@ -3,7 +3,6 @@
 
 import os
 import logging
-from collections import OrderedDict
 import math
 import itertools
 from abc import ABC, abstractmethod
@@ -16,7 +15,6 @@ from sklearn.metrics import classification_report
 import tensorflow as tf
 from transformers import WarmUp, AdamWeightDecay
 from transformers import AutoConfig
-from transformers import AutoTokenizer
 from transformers import TFAutoModelForSequenceClassification, TFPreTrainedModel
 
 from data_processors import DataProcessor, DataProcessorForSequenceClassification, DatasetInfo
@@ -77,9 +75,7 @@ class TFTrainer(ABC):
           data_cache_dir: the directory path where the data will be cached, "./cache" folder by default.
           model_cache_dir (optional): the directory path where the pretrained model will be cached.
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.pretrained_model_name_or_path, cache_dir=model_cache_dir, use_fast=True)
-
-        self._preprocess_data(data_cache_dir)
+        self._prepare_dataset(data_cache_dir, model_cache_dir)
         self._config_trainer(model_cache_dir)
 
         with self.strategy.scope():
@@ -123,75 +119,13 @@ class TFTrainer(ABC):
         self.train_writer = tf.summary.create_file_writer(log_path + "/train")
         self.test_writer = tf.summary.create_file_writer(log_path + "/test")
 
-    @abstractmethod
-    def _create_features(self) -> None:
+    def _prepare_dataset(self, data_cache_dir: str, model_cache_dir: str) -> None:
         """
-        Create the features for the training and validation data.
-        """
-        pass
-
-    @abstractmethod
-    def _load_cache(self, cached_file: str) -> tf.data.Dataset:
-        """
-        Load a cached TFRecords dataset.
+        Prepare the training, validation and test data.
         Args:
-          cached_file: the TFRecords file path.
+          data_cache_dir: the directory path where the cached data are / should be saved.
         """
-        pass
-
-    @abstractmethod
-    def _save_cache(self, mode: str, cached_file: str) -> None:
-        """
-        Save a cached TFRecords dataset.
-        Args:
-          mode: the dataset to be cached.
-          cached_file: the file path where the TFRecords will be saved.
-        """
-        pass
-
-    def _preprocess_data(self, cache_dir: str) -> None:
-        """
-        Preprocess the training and validation data.
-        Args:
-          cache_dir: the directory path where the cached data are / should be saved.
-        """
-        cached_training_features_file = os.path.join(
-            cache_dir, "cached_train_{}_{}_{}.tf_record".format(
-                self.config.task.replace("/", "-"), list(filter(None, self.config.pretrained_model_name_or_path.split("/"))).pop(), str(self.config.max_len)
-            ),
-        )
-        cached_validation_features_file = os.path.join(
-            cache_dir, "cached_validation_{}_{}_{}.tf_record".format(
-                self.config.task.replace("/", "-"), list(filter(None, self.config.pretrained_model_name_or_path.split("/"))).pop(), str(self.config.max_len)
-            ),
-        )
-        cached_test_features_file = os.path.join(
-            cache_dir, "cached_test_{}_{}_{}.tf_record".format(
-                self.config.task.replace("/", "-"), list(filter(None, self.config.pretrained_model_name_or_path.split("/"))).pop(), str(self.config.max_len)
-            ),
-        )
-
-        if os.path.exists(cached_training_features_file) and os.path.exists(cached_validation_features_file):
-            self.dataset_info = DatasetInfo.load(cache_dir)
-            logger.info("Loading features from cached file %s", cached_training_features_file)
-            self.datasets["train"] = self._load_cache(cached_training_features_file)
-            logger.info("Loading features from cached file %s", cached_validation_features_file)
-            self.datasets["validation"] = self._load_cache(cached_validation_features_file)
-            logger.info("Loading features from cached file %s", cached_test_features_file)
-            self.datasets["test"] = self._load_cache(cached_test_features_file)
-        else:
-            os.makedirs(cache_dir, exist_ok=True)
-            self.processor.create_examples()
-            self._create_features()
-            self.dataset_info = self.processor.datasetinfo()
-            logger.info("Create cache file %s", cached_training_features_file)
-            self._save_cache("train", cached_training_features_file)
-            logger.info("Create cache file %s", cached_validation_features_file)
-            self._save_cache("validation", cached_validation_features_file)
-            logger.info("Create cache file %s", cached_test_features_file)
-            self._save_cache("test", cached_test_features_file)
-            self.dataset_info.save(cache_dir)
-
+        self.datasets, self.dataset_info, self.tokenizer = self.processor.preprocess_data(data_cache_dir, model_cache_dir, self.config.task, self.config.pretrained_model_name_or_path)
         train_batch = self.config.train_batch_size * self.strategy.num_replicas_in_sync
         eval_batch = self.config.eval_batch_size * self.strategy.num_replicas_in_sync
         test_batch = self.config.eval_batch_size
@@ -360,14 +294,6 @@ class TFTrainerForSequenceClassification(TFTrainer):
         self.model_class = TFAutoModelForSequenceClassification
         self.labels: List[str] = []
 
-    def _create_features(self) -> None:
-        self.datasets["train"] = self.processor.convert_examples_to_features("train", self.tokenizer, self.config.max_len, return_dataset="tf")
-        self.datasets["validation"] = self.processor.convert_examples_to_features("validation", self.tokenizer, self.config.max_len, return_dataset="tf")
-        self.datasets["test"] = self.processor.convert_examples_to_features("test", self.tokenizer, self.config.max_len, return_dataset="tf")
-
-        if self.datasets["test"] is None:
-            self.datasets["test"] = self.datasets["validation"]
-
     def get_labels(self) -> List[str]:
         """
         Returns the list of labels associated to the trained model.
@@ -379,52 +305,6 @@ class TFTrainerForSequenceClassification(TFTrainer):
         self.label2id = {label: i for i, label in enumerate(self.labels)}
         self.id2label = {i: label for i, label in enumerate(self.labels)}
         self.model_config = AutoConfig.from_pretrained(self.config.pretrained_model_name_or_path, num_labels=len(self.labels), id2label=self.id2label, label2id=self.label2id, cache_dir=model_cache_dir)
-
-    def _load_cache(self, cached_file: str) -> tf.data.Dataset:
-        name_to_features = {
-            "input_ids": tf.io.FixedLenFeature([self.config.max_len], tf.int64),
-            "attention_mask": tf.io.FixedLenFeature([self.config.max_len], tf.int64),
-            "token_type_ids": tf.io.FixedLenFeature([self.config.max_len], tf.int64),
-            "label": tf.io.FixedLenFeature([1], tf.int64),
-        }
-
-        def _decode_record(record):
-            example = tf.io.parse_single_example(record, name_to_features)
-
-            return {k : example[k] for k in ('input_ids', 'attention_mask', 'token_type_ids') if k in example}, example["label"]
-
-        d = tf.data.TFRecordDataset(cached_file)
-        d = d.map(_decode_record, num_parallel_calls=4)
-
-        return d
-
-    def _save_cache(self, mode: str, cached_file: str) -> None:
-        writer = tf.io.TFRecordWriter(cached_file)
-        ds = self.datasets[mode].enumerate()
-
-        # as_numpy_iterator() is available since TF 2.1
-        for (index, (feature, label)) in ds.as_numpy_iterator():
-            if index % 10000 == 0:
-                logger.info("Writing example %d", index)
-
-            def create_list_int_feature(values):
-                f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
-                return f
-
-            def create_int_feature(value):
-                f = tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
-                return f
-
-            record_feature = OrderedDict()
-            record_feature["input_ids"] = create_list_int_feature(feature["input_ids"])
-            record_feature["attention_mask"] = create_list_int_feature(feature["attention_mask"])
-            record_feature["token_type_ids"] = create_list_int_feature(feature["token_type_ids"])
-            record_feature["label"] = create_int_feature(label)
-            tf_example = tf.train.Example(features=tf.train.Features(feature=record_feature))
-
-            writer.write(tf_example.SerializeToString())
-
-        writer.close()
 
     @tf.function
     def _distributed_test_step(self, dist_inputs: Tuple[Dict[str, tf.Tensor], tf.Tensor]) -> None:

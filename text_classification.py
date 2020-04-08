@@ -2,6 +2,10 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
 from trainer_tf import TFTrainerForSequenceClassification
 
 

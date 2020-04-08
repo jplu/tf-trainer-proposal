@@ -7,10 +7,24 @@ from typing import Dict, List
 import csv
 import json
 import os
+from collections import OrderedDict
 
 from transformers import InputExample, InputFeatures
-from transformers import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer, AutoTokenizer
 from transformers import is_tf_available, is_torch_available
+
+
+# Move to src/transformers/data/__init__.py
+try:
+    import tensorflow_datasets  # noqa: F401
+
+    _has_tfds = True
+except ImportError:
+    _has_tfds = False
+
+
+def is_tfds_available():
+    return _has_tfds
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +54,12 @@ class DatasetInfo(object):
 
         return cls(**json_string)
 
+    @staticmethod
+    def exists(cache_dir):
+        path = os.path.join(cache_dir, "dataset_info.json")
+
+        return os.path.exists(path)
+
 
 class DataProcessor(ABC):
     """Base class for data converters for sequence classification data sets."""
@@ -52,16 +72,13 @@ class DataProcessor(ABC):
         self.files["train"] = config.pop("train_file", None)
         self.files["validation"] = config.pop("dev_file", None)
         self.files["test"] = config.pop("test_file", None)
+        self.max_len: int = config.pop("max_len", None)
         self.format = config.pop("format", None)
         self.skip_first_row: bool = config.pop("skip_first_row", False)
         self.delimiter: str = config.pop("delimiter", "\t")
         self.quotechar: str = config.pop("quotechar", "\"")
-        self.info = None
 
         assert len(config) == 0, "unrecognized params passed: %s" % ",".join(config.keys())
-
-    def datasetinfo(self):
-        return self.info
 
     @abstractmethod
     def _read_csv_and_create_examples(self, mode):
@@ -75,21 +92,103 @@ class DataProcessor(ABC):
     def _read_json_and_create_examples(self, mode):
         pass
 
-    def create_examples(self):
-        for mode in ["train", "validation", "test"]:
-            if self.format == "csv":
-                self._read_csv_and_create_examples(mode)
-            elif self.format == "json":
-                self._read_json_and_create_examples(mode)
-            elif self.format == "tfds":
-                self._read_tfds_and_create_examples(mode)
-            else:
-                raise ValueError("The format {} is not allowed, take one of csv, json or tfds".format(self.format))
-
-        self.info = DatasetInfo(self.labels, {k: len(v) for k, v in self.examples.items()})
+    @abstractmethod
+    def _load_cached_dataset(self, file, return_dataset="tf"):
+        """
+        Load a cached dataset.
+        Args:
+          file: the file path where the cache will be saved.
+          dataset: the dataset we want to save.
+          input_dataset: if the dataset is from a TF or PT format.
+        """
+        pass
 
     @abstractmethod
-    def convert_examples_to_features(self, mode: str, tokenizer: PreTrainedTokenizer, max_len: int, return_dataset: str = "tf"):
+    def _cache_dataset(self, file, dataset, input_dataset="tf"):
+        """
+        Cache a dataset.
+        Args:
+          file: the file path where the cache will be saved.
+          dataset: the dataset we want to save.
+          input_dataset: if the dataset is from a TF or PT format.
+        """
+        pass
+
+    def preprocess_data(self, data_cache_dir: str, model_cache_dir: str, task: str, pretrained_model_name_or_path: str, return_dataset: str = "tf"):
+        """
+        Preprocess the training and validation data.
+        Args:
+          cache_dir: the directory path where the cached data are / should be saved.
+        """
+        cached_training_features_file = os.path.join(
+            data_cache_dir, "cached_train_{}_{}_{}.tf_record".format(
+                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len)
+            ),
+        )
+        cached_validation_features_file = os.path.join(
+            data_cache_dir, "cached_validation_{}_{}_{}.tf_record".format(
+                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len)
+            ),
+        )
+        cached_test_features_file = os.path.join(
+            data_cache_dir, "cached_test_{}_{}_{}.tf_record".format(
+                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len)
+            ),
+        )
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, cache_dir=model_cache_dir, use_fast=True)
+        datasets = {}
+
+        os.makedirs(data_cache_dir, exist_ok=True)
+
+        if os.path.exists(cached_training_features_file):
+            logger.info("Loading features from cached file %s", cached_training_features_file)
+            datasets["train"] = self._load_cached_dataset(cached_training_features_file, return_dataset)
+        else:
+            self.create_examples("train")
+            datasets["train"] = self._convert_examples_to_features("train", tokenizer, return_dataset)
+            self._cache_dataset(cached_training_features_file, datasets["train"], input_dataset=return_dataset)
+
+        if os.path.exists(cached_validation_features_file):
+            logger.info("Loading features from cached file %s", cached_validation_features_file)
+            datasets["validation"] = self._load_cached_dataset(cached_validation_features_file, return_dataset)
+        else:
+            self.create_examples("validation")
+            datasets["validation"] = self._convert_examples_to_features("validation", tokenizer, return_dataset)
+            self._cache_dataset(cached_validation_features_file, datasets["validation"], input_dataset=return_dataset)
+
+        if os.path.exists(cached_test_features_file):
+            logger.info("Loading features from cached file %s", cached_test_features_file)
+            datasets["test"] = self._load_cached_dataset(cached_test_features_file, return_dataset)
+        else:
+            self.create_examples("test")
+            datasets["test"] = self._convert_examples_to_features("test", tokenizer, return_dataset)
+
+            if datasets["test"] is None:
+                datasets["test"] = datasets["validation"]
+
+            self._cache_dataset(cached_test_features_file, datasets["test"], input_dataset=return_dataset)
+
+        if DatasetInfo.exists(data_cache_dir):
+            dataset_info = DatasetInfo.load(data_cache_dir)
+        else:
+            dataset_info = DatasetInfo(self.labels, {k: len(v) for k, v in self.examples.items()})
+
+            dataset_info.save(data_cache_dir)
+
+        return datasets, dataset_info, tokenizer
+
+    def create_examples(self, mode):
+        if self.format == "csv":
+            self._read_csv_and_create_examples(mode)
+        elif self.format == "json":
+            self._read_json_and_create_examples(mode)
+        elif self.format == "tfds":
+            self._read_tfds_and_create_examples(mode)
+        else:
+            raise ValueError("The format {} is not allowed, take one of csv, json or tfds".format(self.format))
+
+    @abstractmethod
+    def _convert_examples_to_features(self, mode: str, tokenizer: PreTrainedTokenizer, return_dataset: str = "tf"):
         pass
 
 
@@ -177,11 +276,14 @@ class DataProcessorForSequenceClassification(DataProcessor):
         self.labels = list(set(self.labels).union(seen_labels))
 
     def _read_tfds_and_create_examples(self, mode):
+        if not is_tfds_available():
+            raise RuntimeError("The package tensorflow_datasets can't be imported")
+
         import tensorflow_datasets as tfds
         try:
             ds, dsinfo = tfds.load(self.dataset_name, split=mode, with_info=True)
         except KeyError:
-            return
+            raise ValueError("The dataset {} does not exists in the tensorflow_datasets catalog.".format(self.dataset_name))
 
         seen_labels = set()
 
@@ -216,22 +318,97 @@ class DataProcessorForSequenceClassification(DataProcessor):
     def _read_json_and_create_examples(self, mode):
         pass
 
-    def convert_examples_to_features(self, mode: str, tokenizer: PreTrainedTokenizer, max_len: int, return_dataset: str = "tf"):
-        if max_len is None:
-            max_len = tokenizer.max_len
+    def _load_cached_dataset(self, cached_file, return_dataset="tf"):
+        if return_dataset == "tf":
+            if not is_tf_available():
+                raise RuntimeError("return_dataset set to 'tf' but TensorFlow 2.0 can't be imported")
 
+            import tensorflow as tf
+
+            name_to_features = {
+                "input_ids": tf.io.FixedLenFeature([self.max_len], tf.int64),
+                "attention_mask": tf.io.FixedLenFeature([self.max_len], tf.int64),
+                "token_type_ids": tf.io.FixedLenFeature([self.max_len], tf.int64),
+                "label": tf.io.FixedLenFeature([1], tf.int64),
+            }
+
+            def _decode_record(record):
+                example = tf.io.parse_single_example(record, name_to_features)
+
+                return {k : example[k] for k in ('input_ids', 'attention_mask', 'token_type_ids') if k in example}, example["label"]
+
+            d = tf.data.TFRecordDataset(cached_file)
+            d = d.map(_decode_record, num_parallel_calls=4)
+
+            return d
+
+        elif return_dataset == "pt":
+            if not is_torch_available():
+                raise RuntimeError("return_dataset set to 'pt' but PyTorch can't be imported")
+
+            import torch  # noqa: F401
+            from torch.utils.data import TensorDataset  # noqa: F401
+
+            return None
+        else:
+            raise ValueError("return_dataset should be one of 'tf' or 'pt'")
+
+    def _cache_dataset(self, file, dataset, input_dataset="tf"):
+        if input_dataset == "tf":
+            if not is_tf_available():
+                raise RuntimeError("return_dataset set to 'tf' but TensorFlow 2.0 can't be imported")
+
+            import tensorflow as tf
+
+            writer = tf.io.TFRecordWriter(file)
+            ds = dataset.enumerate()
+
+            for (index, (feature, label)) in ds:
+                if index % 10000 == 0:
+                    logger.info("Writing example %d", index)
+
+                def create_list_int_feature(values):
+                    f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
+                    return f
+
+                def create_int_feature(value):
+                    f = tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
+                    return f
+
+                record_feature = OrderedDict()
+                record_feature["input_ids"] = create_list_int_feature(feature["input_ids"])
+                record_feature["attention_mask"] = create_list_int_feature(feature["attention_mask"])
+                record_feature["token_type_ids"] = create_list_int_feature(feature["token_type_ids"])
+                record_feature["label"] = create_int_feature(label)
+                tf_example = tf.train.Example(features=tf.train.Features(feature=record_feature))
+
+                writer.write(tf_example.SerializeToString())
+
+            writer.close()
+        elif input_dataset == "pt":
+            if not is_torch_available():
+                raise RuntimeError("return_dataset set to 'pt' but PyTorch can't be imported")
+
+            import torch  # noqa: F401
+            from torch.utils.data import TensorDataset  # noqa: F401
+
+            return None
+        else:
+            raise ValueError("input_dataset should be one of 'tf' or 'pt'")
+
+    def _convert_examples_to_features(self, mode: str, tokenizer: PreTrainedTokenizer, return_dataset: str = "tf"):
         features = []
 
         for (ex_index, example) in enumerate(self.examples[mode]):
             if ex_index % 10000 == 0:
                 logger.info("Tokenizing example %d", ex_index)
 
-            feature = tokenizer.encode_plus(example.text_a, example.text_b, add_special_tokens=True, max_length=max_len, pad_to_max_length=True)
+            feature = tokenizer.encode_plus(example.text_a, example.text_b, add_special_tokens=True, max_length=self.max_len, pad_to_max_length=True)
             label = self.labels.index(example.label)
 
-            assert len(feature["input_ids"]) == max_len
-            assert len(feature["attention_mask"]) == max_len
-            assert len(feature["token_type_ids"]) == max_len
+            assert len(feature["input_ids"]) == self.max_len
+            assert len(feature["attention_mask"]) == self.max_len
+            assert len(feature["token_type_ids"]) == self.max_len
 
             if ex_index < 5:
                 logger.info("*** Example ***")
@@ -280,4 +457,4 @@ class DataProcessorForSequenceClassification(DataProcessor):
 
             return dataset
         else:
-            raise ValueError("return_tensors should be one of 'tf' or 'pt'")
+            raise ValueError("return_dataset should be one of 'tf' or 'pt'")

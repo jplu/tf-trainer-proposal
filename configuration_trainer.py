@@ -26,7 +26,6 @@ class TrainerConfig(object):
         self.epochs: int = kwargs.pop("epochs", None)
         self.max_grad_norm: float = kwargs.pop("max_grad_norm", 1.0)
         self.metric_name: str = kwargs.pop("metric_name", None)
-        self.max_len: int = kwargs.pop("max_len", None)
         self.task: str = kwargs.pop("task", None)
 
     def save_trainer(self, save_directory):
