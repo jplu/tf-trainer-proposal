@@ -121,18 +121,18 @@ class DataProcessor(ABC):
           cache_dir: the directory path where the cached data are / should be saved.
         """
         cached_training_features_file = os.path.join(
-            data_cache_dir, "cached_train_{}_{}_{}.tf_record".format(
-                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len)
+            data_cache_dir, "cached_train_{}_{}_{}.{}_record".format(
+                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len), return_dataset
             ),
         )
         cached_validation_features_file = os.path.join(
-            data_cache_dir, "cached_validation_{}_{}_{}.tf_record".format(
-                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len)
+            data_cache_dir, "cached_validation_{}_{}_{}.{}_record".format(
+                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len), return_dataset
             ),
         )
         cached_test_features_file = os.path.join(
-            data_cache_dir, "cached_test_{}_{}_{}.tf_record".format(
-                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len)
+            data_cache_dir, "cached_test_{}_{}_{}.{}_record".format(
+                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len), return_dataset
             ),
         )
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, cache_dir=model_cache_dir, use_fast=True)
@@ -346,10 +346,11 @@ class DataProcessorForSequenceClassification(DataProcessor):
             if not is_torch_available():
                 raise RuntimeError("return_dataset set to 'pt' but PyTorch can't be imported")
 
-            import torch  # noqa: F401
-            from torch.utils.data import TensorDataset  # noqa: F401
+            import torch
 
-            return None
+            d = torch.load(cached_file)
+
+            return d
         else:
             raise ValueError("return_dataset should be one of 'tf' or 'pt'")
 
@@ -389,10 +390,9 @@ class DataProcessorForSequenceClassification(DataProcessor):
             if not is_torch_available():
                 raise RuntimeError("return_dataset set to 'pt' but PyTorch can't be imported")
 
-            import torch  # noqa: F401
-            from torch.utils.data import TensorDataset  # noqa: F401
+            import torch
 
-            return None
+            torch.save(dataset, file)
         else:
             raise ValueError("input_dataset should be one of 'tf' or 'pt'")
 

@@ -1,0 +1,25 @@
+{
+    
+    "pretrained_model_name_or_path": "bert-base-cased",
+    "optimizer_name": "adam",
+    "learning_rate": 5e-5,
+    "loss_name": "SparseCategoricalCrossentropy",
+    "train_batch_size": 8,
+    "eval_batch_size": 8,
+    "strategy_name": "onedevice",
+    "epochs": 4,
+    "metric_name": "SparseCategoricalAccuracy",
+    "task": "bbc-classifier",
+    "data_processor": {
+        "train_file": "data/train.csv",
+        "dev_file": "data/test.csv",
+        "skip_first_row": "true",
+        "delimiter": ",",
+        "format": "csv",
+        "max_len": 512,
+        "guid": -1,
+        "text_a": 1,
+        "text_b": -1,
+        "label": 0
+    }
+}

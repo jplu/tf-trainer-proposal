@@ -5,6 +5,7 @@
     "loss_name": "SparseCategoricalCrossentropy",
     "train_batch_size": 16,
     "eval_batch_size": 32,
+    "strategy_name": "onedevice",
     "epochs": 4,
     "metric_name": "SparseCategoricalAccuracy",
     "task": "glue/mrpc",
