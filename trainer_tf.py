@@ -1,29 +1,28 @@
 # coding=utf-8
-""" Trainer class."""
+"""Tensorflow trainer class."""
 
 import os
 import logging
 import math
 import itertools
-from abc import ABC, abstractmethod
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 
 from sklearn.metrics import classification_report
 
 import tensorflow as tf
-from transformers import WarmUp, AdamWeightDecay
+from transformers import WarmUp, AdamWeightDecay, GradientAccumulator
 from transformers import AutoConfig
-from transformers import TFAutoModelForSequenceClassification, TFPreTrainedModel
+from transformers import TFAutoModelForSequenceClassification
 
-from data_processors import DataProcessor, DataProcessorForSequenceClassification, DatasetInfo
+from data_processors import DataProcessorForSequenceClassification, DatasetInfo
 from configuration_trainer import TrainerConfig
 
 logger = logging.getLogger(__name__)
 
 
-class TFTrainer(ABC):
+class TFTrainer():
     def __init__(self, config_path: str = None, config: TrainerConfig = None, **kwargs):
         """
         The list of keys in kwargs here should be generic to all the possible models/architectures
@@ -47,9 +46,13 @@ class TFTrainer(ABC):
         assert len(unused_kwargs) == 0, "unrecognized params passed: %s" % ",".join(unused_kwargs.keys())
 
         self.datasets: Dict[str, tf.data.Dataset] = {}
-        self.processor: DataProcessor
-        self.model_class: TFPreTrainedModel
         self.dataset_info: DatasetInfo
+        self.gradient_accumulator = GradientAccumulator()
+        self.accum_steps = 1
+
+        if self.config.mode == "classification":
+            self.processor = DataProcessorForSequenceClassification(**self.data_processor_config)
+            self.model_class = TFAutoModelForSequenceClassification
 
         if self.strategy_name == "mirrored":
             self.strategy = tf.distribute.MirroredStrategy()
@@ -81,6 +84,7 @@ class TFTrainer(ABC):
         with self.strategy.scope():
             self.model = self.model_class.from_pretrained(self.config.pretrained_model_name_or_path, config=self.model_config, cache_dir=model_cache_dir)
             self._create_optimizer()
+            _ = self.optimizer.iterations
             self._set_loss_and_metric()
             self._create_checkpoint_manager(checkpoint_path)
             self._create_summary_writer(log_path)
@@ -92,7 +96,12 @@ class TFTrainer(ABC):
         Args:
           model_cache_dir (optional): the directory path where the pretrained model will be cached.
         """
-        self.model_config = AutoConfig.from_pretrained(self.config.pretrained_model_name_or_path, cache_dir=model_cache_dir)
+        if self.config.mode == "classification":
+            label2id = {label: i for i, label in enumerate(self.dataset_info.labels)}
+            id2label = {i: label for i, label in enumerate(self.dataset_info.labels)}
+            self.model_config = AutoConfig.from_pretrained(self.config.pretrained_model_name_or_path, num_labels=len(self.dataset_info.labels), id2label=id2label, label2id=label2id, cache_dir=model_cache_dir)
+        else:
+            self.model_config = AutoConfig.from_pretrained(self.config.pretrained_model_name_or_path, cache_dir=model_cache_dir)
 
     def _set_loss_and_metric(self) -> None:
         """
@@ -106,8 +115,6 @@ class TFTrainer(ABC):
 
         self.train_acc_metric = tf.keras.metrics.get({"class_name": self.config.metric_name, "config": {"name": "train_accuracy"}})
         self.test_acc_metric = tf.keras.metrics.get({"class_name": self.config.metric_name, "config": {"name": "test_accuracy"}})
-
-        self.test_loss_metric = tf.keras.metrics.Mean(name='test_loss')
 
     def _create_summary_writer(self, log_path: str) -> None:
         """
@@ -175,99 +182,160 @@ class TFTrainer(ABC):
         if load_model:
             ckpt.restore(self.model.ckpt_manager.latest_checkpoint)
 
-    def _evaluate_during_training(self) -> None:
+    def _evaluate(self, dataset) -> None:
         """
         Evaluate the model during the training at the end of each epoch.
         """
-        num_batches = 0
-        test_step = 1
+        step = 1
+        loss = 0.0
 
-        for batch in self.datasets["validation"]:
-            test_step = tf.convert_to_tensor(test_step, dtype=tf.int64)
-            self._distributed_test_step(batch)
-            num_batches += 1
+        for features, labels in dataset:
+            step = tf.convert_to_tensor(step, dtype=tf.int64)
+            loss = self._run_model(features, labels, False)
 
             with self.test_writer.as_default():
-                tf.summary.scalar("loss", self.test_loss_metric.result(), step=test_step)
+                tf.summary.scalar("loss", loss, step=step)
 
-            if test_step % self.validation_steps == 0:
+            if step % self.validation_steps == 0:
                 break
 
-            test_step += 1
+            step += 1
+
+        return loss
 
     def train(self) -> None:
         """
         Train method to train the model.
         """
-        with self.strategy.scope():
-            tf.summary.trace_on(graph=True, profiler=True)
-            step = 1
-            train_loss = 0.0
+        tf.summary.trace_on(graph=True, profiler=True)
+        self.gradient_accumulator.reset()
 
-            for epoch in range(1, self.config.epochs + 1):
-                total_loss = 0.0
-                num_batches = 0
+        iterations = self.optimizer.iterations
+        tf.summary.experimental.set_step(iterations)
 
-                for batch in self.datasets["train"]:
-                    step = tf.convert_to_tensor(step, dtype=tf.int64)
-                    total_loss += self._distributed_train_step(batch)
-                    num_batches += 1
+        for epoch in range(1, self.config.epochs + 1):
+            for training_loss in self._training_steps(self.datasets["train"]):
+                step = iterations.numpy()
 
+                with self.train_writer.as_default():
+                    tf.summary.scalar("loss", training_loss, step=step)
+
+                if step == 1:
                     with self.train_writer.as_default():
-                        tf.summary.scalar("loss", total_loss / num_batches, step=step)
+                        tf.summary.trace_export(name="training", step=step, profiler_outdir=self.log_path)
 
-                    if step == 1:
-                        with self.train_writer.as_default():
-                            tf.summary.trace_export(name="training", step=step, profiler_outdir=self.log_path)
+                if step % 10 == 0:
+                    logger.info("Epoch {} Step {} Loss {:.4f} Train Accuracy {:.4f}".format(epoch, step, training_loss.numpy(), self.train_acc_metric.result()))
 
-                    if step % 10 == 0:
-                        logger.info("Epoch {} Step {} Loss {:.4f} Train Accuracy {:.4f}".format(epoch, step.numpy(), total_loss.numpy() / num_batches, self.train_acc_metric.result()))
+                if step % 100 == 0:
+                    ckpt_save_path = self.model.ckpt_manager.save()
+                    logger.info("Saving checkpoint for step {} at {}".format(step, ckpt_save_path))
 
-                    if step % 100 == 0:
-                        ckpt_save_path = self.model.ckpt_manager.save()
-                        logger.info("Saving checkpoint for step {} at {}".format(step, ckpt_save_path))
+                if step % self.train_steps == 0:
+                    break
 
-                    if step % self.train_steps == 0:
-                        step += 1
-                        break
+            test_loss = self._evaluate(self.datasets["validation"])
 
-                    step += 1
+            logger.info("Epoch {} Step {} Train Loss {:.4f} Train Accuracy {:.4f}".format(epoch, step, training_loss.numpy(), self.train_acc_metric.result()))
+            logger.info("Epoch {} Validation Loss {:.4f} Validation Accuracy {:.4f}".format(epoch, test_loss.numpy(), self.test_acc_metric.result()))
 
-                train_loss = total_loss / num_batches
+        if epoch != self.epochs:
+            self.train_acc_metric.reset_states()
+            self.test_acc_metric.reset_states()
 
-                self._evaluate_during_training()
-
-                logger.info("Epoch {} Step {} Train Loss {:.4f} Train Accuracy {:.4f}".format(epoch, step.numpy() - 1, train_loss.numpy(), self.train_acc_metric.result()))
-                logger.info("Epoch {} Validation Loss {:.4f} Validation Accuracy {:.4f}".format(epoch, self.test_loss_metric.result(), self.test_acc_metric.result()))
-
-            if epoch != self.epochs:
-                self.train_acc_metric.reset_states()
-                self.test_acc_metric.reset_states()
-
-    @abstractmethod
-    def _distributed_test_step(self, dist_inputs: Tuple[Dict[str, tf.Tensor], tf.Tensor]) -> None:
+    def _training_steps(self, dataset):
         """
-        Method that represents a custom test step in distributed mode
+        Returns a generator over training steps (i.e. parameters update).
         Args:
-          dist_inputs: the features batch of the test data
+          dataset: The training dataset.
+        Returns:
+          A generator that yields a loss value to report for this step.
         """
-        pass
+        for i, loss in enumerate(self._accumulate_next_gradients(dataset)):
+            if i % self.accum_steps == 0:
+                self._apply_gradients()
+                yield loss
 
-    @abstractmethod
-    def _distributed_train_step(self, dist_inputs: Tuple[Dict[str, tf.Tensor], tf.Tensor]) -> float:
+    @tf.function
+    def _apply_gradients(self):
+        """Applies the gradients (cross-replica)."""
+        self.strategy.experimental_run_v2(self._step)
+
+    def _step(self):
+        """Applies gradients and resets accumulation."""
+        gradient_scale = self.gradient_accumulator.step * self.strategy.num_replicas_in_sync
+        gradients = [gradient / tf.cast(gradient_scale, gradient.dtype) for gradient in self.gradient_accumulator.gradients]
+        gradients = [(tf.clip_by_value(grad, -self.config.max_grad_norm, self.config.max_grad_norm)) for grad in gradients]
+        self.optimizer.apply_gradients(list(zip(gradients, self.model.trainable_variables)))
+        self.gradient_accumulator.reset()
+
+    def _accumulate_next_gradients(self, dataset):
+        """Accumulates the gradients from the next element in dataset."""
+        iterator = iter(dataset)
+
+        @tf.function
+        def _accumulate_next():
+            per_replica_features, per_replica_labels = next(iterator)
+
+            return self._accumulate_gradients(per_replica_features, per_replica_labels)
+
+        while True:
+            try:
+                yield _accumulate_next()
+            except tf.errors.OutOfRangeError:
+                break
+
+    def _accumulate_gradients(self, per_replica_features, per_replica_labels):
+        """Accumulates the gradients across all the replica."""
+        per_replica_loss = self.strategy.experimental_run_v2(self._forward, args=(per_replica_features, per_replica_labels))
+
+        return self.strategy.reduce(tf.distribute.ReduceOp.MEAN, per_replica_loss, None)
+
+    def _forward(self, features, labels):
+        """Forwards a training example and accumulates the gradients."""
+        per_example_loss = self._run_model(features, labels, True)
+        loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=self.config.train_batch_size)
+        gradients = self.optimizer.get_gradients(loss, self.model.trainable_variables)
+
+        self.gradient_accumulator(gradients)
+
+        return loss
+
+    def _run_model(self, features, labels, training):
         """
-        Method that represents a custom training step in distributed mode.
+        Computes the loss of the given features and labels pair.
         Args:
-          dist_inputs: the features batch of the training data
+          features: the batched features.
+          labels: the batched labels.
         """
-        pass
+        logits = self.model(features, training=training)
 
-    @abstractmethod
-    def evaluate(self) -> None:
+        if self.config.mode == "classification":
+            loss = self.loss(labels, logits[0])
+
+            if training:
+                self.train_acc_metric(labels, logits[0])
+            else:
+                self.test_acc_metric(labels, logits[0])
+
+            return loss
+
+    def test(self) -> None:
         """
-        Evaluate the model over the test dataset and print a report.
+        Test the model over the test dataset and print a report.
         """
-        pass
+        y_true = []
+        results = self.model.predict(self.datasets["test"], steps=self.test_steps)
+
+        if self.config.mode == "classification":
+            for batch in self.datasets["test"]:
+                y_true.extend(batch[1].numpy().tolist())
+
+            y_pred = np.reshape(np.argmax(results, axis=-1), (-1, 1)).tolist()
+            y_true = list(itertools.chain.from_iterable(y_true))
+            y_pred = list(itertools.chain.from_iterable(y_pred))
+
+            logger.info(classification_report(y_true, y_pred, target_names=self.dataset_info.labels))
 
     def save_model(self, save_path: str) -> None:
         """
@@ -285,75 +353,3 @@ class TFTrainer(ABC):
         self.tokenizer.save_pretrained(save_path)
         self.config.save_trainer(save_path)
         tf.saved_model.save(self.model, path)
-
-
-class TFTrainerForSequenceClassification(TFTrainer):
-    def __init__(self, config_path: str = None, config: TrainerConfig = None, **kwargs):
-        super().__init__(config_path, config, **kwargs)
-        self.processor = DataProcessorForSequenceClassification(**self.data_processor_config)
-        self.model_class = TFAutoModelForSequenceClassification
-        self.labels: List[str] = []
-
-    def get_labels(self) -> List[str]:
-        """
-        Returns the list of labels associated to the trained model.
-        """
-        return self.dataset_info.labels
-
-    def _config_trainer(self, model_cache_dir: str) -> None:
-        self.labels = self.dataset_info.labels
-        self.label2id = {label: i for i, label in enumerate(self.labels)}
-        self.id2label = {i: label for i, label in enumerate(self.labels)}
-        self.model_config = AutoConfig.from_pretrained(self.config.pretrained_model_name_or_path, num_labels=len(self.labels), id2label=self.id2label, label2id=self.label2id, cache_dir=model_cache_dir)
-
-    @tf.function
-    def _distributed_test_step(self, dist_inputs: Tuple[Dict[str, tf.Tensor], tf.Tensor]) -> None:
-        def step_fn(inputs):
-            features, labels = inputs
-            logits = self.model(features, training=False)
-            loss = self.loss(labels, logits[0]) + sum(self.model.losses)
-
-            self.test_acc_metric(labels, logits[0])
-            self.test_loss_metric(loss)
-
-        self.strategy.experimental_run_v2(step_fn, args=(dist_inputs,))
-
-    @tf.function
-    def _distributed_train_step(self, dist_inputs: Tuple[Dict[str, tf.Tensor], tf.Tensor]) -> float:
-        def step_fn(inputs):
-            features, labels = inputs
-
-            with tf.GradientTape() as tape:
-                logits = self.model(features, training=True)
-                per_example_loss = self.loss(labels, logits[0])
-                loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=self.config.train_batch_size)
-
-            gradients = tape.gradient(loss, self.model.trainable_variables)
-
-            if self.config.optimizer_name == "adamw":
-                self.optimizer.apply_gradients(list(zip(gradients, self.model.trainable_variables)), self.config.max_grad_norm)
-            else:
-                gradients = [(tf.clip_by_value(grad, -self.config.max_grad_norm, self.config.max_grad_norm)) for grad in gradients]
-                self.optimizer.apply_gradients(list(zip(gradients, self.model.trainable_variables)))
-
-            self.train_acc_metric(labels, logits[0])
-
-            return loss
-
-        per_replica_losses = self.strategy.experimental_run_v2(step_fn, args=(dist_inputs,))
-        sum_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
-
-        return sum_loss
-
-    def evaluate(self) -> None:
-        y_true = []
-        results = self.model.predict(self.datasets["test"], steps=self.test_steps)
-
-        for batch in self.datasets["test"]:
-            y_true.extend(batch[1].numpy().tolist())
-
-        y_pred = np.reshape(np.argmax(results, axis=-1), (-1, 1)).tolist()
-        y_true = list(itertools.chain.from_iterable(y_true))
-        y_pred = list(itertools.chain.from_iterable(y_pred))
-
-        logger.info(classification_report(y_true, y_pred, target_names=self.label2id.keys()))

@@ -8,6 +8,7 @@
     "epochs": 4,
     "metric_name": "SparseCategoricalAccuracy",
     "task": "glue/mrpc",
+    "mode": "classification",
     "data_processor": {
         "dataset_name": "glue/mrpc",
         "format": "tfds",
