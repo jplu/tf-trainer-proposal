@@ -14,9 +14,9 @@ from sklearn.metrics import classification_report
 import tensorflow as tf
 from transformers import WarmUp, AdamWeightDecay, GradientAccumulator
 from transformers import AutoConfig
-from transformers import TFAutoModelForSequenceClassification
+from transformers import TFAutoModelForSequenceClassification, TFAutoModelForTokenClassification
 
-from data_processors import DataProcessorForSequenceClassification, DatasetInfo
+from data_processors import DataProcessorForSequenceClassification, DataProcessorForTokenClassification, DatasetInfo
 from configuration_trainer import TrainerConfig
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,9 @@ class TFTrainer():
         if self.config.mode == "classification":
             self.processor = DataProcessorForSequenceClassification(**self.data_processor_config)
             self.model_class = TFAutoModelForSequenceClassification
+        elif self.config.mode == "labelling":
+            self.processor = DataProcessorForTokenClassification(**self.data_processor_config)
+            self.model_class = TFAutoModelForTokenClassification
 
         if self.strategy_name == "mirrored":
             self.strategy = tf.distribute.MirroredStrategy()
@@ -295,6 +298,7 @@ class TFTrainer():
         """Forwards a training example and accumulates the gradients."""
         per_example_loss = self._run_model(features, labels, True)
         loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=self.config.train_batch_size)
+        
         gradients = self.optimizer.get_gradients(loss, self.model.trainable_variables)
 
         self.gradient_accumulator(gradients)
@@ -308,17 +312,24 @@ class TFTrainer():
           features: the batched features.
           labels: the batched labels.
         """
-        logits = self.model(features, training=training)
+        if self.config.mode == "classification" or self.config.mode == "labelling":
+            logits = self.model(features, training=training)[0]
+        else:
+            logits = self.mode(features, training=training)
+        """
+        if self.config.mode == "labelling":
+            active_loss = tf.reshape(labels, (-1,)) != -1
+            logits = tf.boolean_mask(tf.reshape(logits, (-1, len(labels))), active_loss)
+            labels = tf.boolean_mask(tf.reshape(labels, (-1,)), active_loss)
+        """
+        loss = self.loss(labels, logits)
 
-        if self.config.mode == "classification":
-            loss = self.loss(labels, logits[0])
+        if training:
+            self.train_acc_metric(labels, logits)
+        else:
+            self.test_acc_metric(labels, logits)
 
-            if training:
-                self.train_acc_metric(labels, logits[0])
-            else:
-                self.test_acc_metric(labels, logits[0])
-
-            return loss
+        return loss
 
     def test(self) -> None:
         """

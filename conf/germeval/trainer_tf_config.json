@@ -1,0 +1,24 @@
+{
+    
+    "pretrained_model_name_or_path": "bert-base-multilingual-cased",
+    "optimizer_name": "adam",
+    "learning_rate": 5e-5,
+    "loss_name": "LabellingLoss",
+    "train_batch_size": 8,
+    "eval_batch_size": 8,
+    "strategy_name": "onedevice",
+    "epochs": 3,
+    "metric_name": "SparseCategoricalAccuracy",
+    "task": "germeval2014",
+    "mode": "labelling",
+    "data_processor": {
+        "train_file": "data/germeval/train.txt",
+        "dev_file": "data/germeval/dev.txt",
+        "test_file": "data/germeval/test.txt",
+        "delimiter": " ",
+        "format": "csv",
+        "max_len": 128,
+        "text_a": 0,
+        "label": 1
+    }
+}
