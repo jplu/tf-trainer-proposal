@@ -185,16 +185,30 @@ class TFTrainer():
         if load_model:
             ckpt.restore(self.model.ckpt_manager.latest_checkpoint)
 
-    def _evaluate(self, dataset) -> None:
+    def _evaluate_steps(self, per_replica_features, per_replica_labels):
+        """
+        One step evaluation across replica.
+        Args:
+          features: the batched features.
+          labels: the batched labels.
+        Returns:
+          The loss corresponding to the given batch.
+        """
+        per_replica_loss = self.strategy.experimental_run_v2(self._run_model, args=(per_replica_features, per_replica_labels, False))
+
+        return self.strategy.reduce(tf.distribute.ReduceOp.MEAN, per_replica_loss, None)
+
+    def _evaluate(self) -> None:
         """
         Evaluate the model during the training at the end of each epoch.
         """
         step = 1
         loss = 0.0
 
-        for features, labels in dataset:
+        for features, labels in self.datasets["validation"]:
             step = tf.convert_to_tensor(step, dtype=tf.int64)
-            loss = self._run_model(features, labels, False)
+            loss = self._evaluate_steps(features, labels)
+            loss = tf.reduce_mean(loss)
 
             with self.test_writer.as_default():
                 tf.summary.scalar("loss", loss, step=step)
@@ -238,7 +252,7 @@ class TFTrainer():
                 if step % self.train_steps == 0:
                     break
 
-            test_loss = self._evaluate(self.datasets["validation"])
+            test_loss = self._evaluate()
 
             logger.info("Epoch {} Step {} Train Loss {:.4f} Train Accuracy {:.4f}".format(epoch, step, training_loss.numpy(), self.train_acc_metric.result()))
             logger.info("Epoch {} Validation Loss {:.4f} Validation Accuracy {:.4f}".format(epoch, test_loss.numpy(), self.test_acc_metric.result()))
