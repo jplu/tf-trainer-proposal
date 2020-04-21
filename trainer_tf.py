@@ -219,6 +219,7 @@ class TFTrainer():
         for epoch in range(1, self.config.epochs + 1):
             for training_loss in self._training_steps(self.datasets["train"]):
                 step = iterations.numpy()
+                training_loss = tf.reduce_mean(training_loss)
 
                 with self.train_writer.as_default():
                     tf.summary.scalar("loss", training_loss, step=step)
@@ -308,7 +309,7 @@ class TFTrainer():
 
         self.gradient_accumulator(gradients)
 
-        return loss
+        return per_example_loss
 
     def _run_model(self, features, labels, training):
         """

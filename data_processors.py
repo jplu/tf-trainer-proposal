@@ -590,10 +590,6 @@ class DataProcessorForTokenClassification(DataProcessor):
                     f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
                     return f
 
-                def create_int_feature(value):
-                    f = tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
-                    return f
-
                 record_feature = OrderedDict()
                 record_feature["input_ids"] = create_list_int_feature(feature["input_ids"])
                 record_feature["attention_mask"] = create_list_int_feature(feature["attention_mask"])
