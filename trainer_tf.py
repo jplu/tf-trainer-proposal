@@ -99,7 +99,7 @@ class TFTrainer():
         Args:
           model_cache_dir (optional): the directory path where the pretrained model will be cached.
         """
-        if self.config.mode == "classification":
+        if self.config.mode == "classification" or self.config.mode == "labelling":
             label2id = {label: i for i, label in enumerate(self.dataset_info.labels)}
             id2label = {i: label for i, label in enumerate(self.dataset_info.labels)}
             self.model_config = AutoConfig.from_pretrained(self.config.pretrained_model_name_or_path, num_labels=len(self.dataset_info.labels), id2label=id2label, label2id=label2id, cache_dir=model_cache_dir)
@@ -269,7 +269,10 @@ class TFTrainer():
         gradient_scale = self.gradient_accumulator.step * self.strategy.num_replicas_in_sync
         gradients = [gradient / tf.cast(gradient_scale, gradient.dtype) for gradient in self.gradient_accumulator.gradients]
         gradients = [(tf.clip_by_value(grad, -self.config.max_grad_norm, self.config.max_grad_norm)) for grad in gradients]
-        self.optimizer.apply_gradients(list(zip(gradients, self.model.trainable_variables)))
+        vars = self.model.trainable_variables
+        if self.config.mode == "labelling":
+            vars = [var for var in self.model.trainable_variables if "pooler" not in var.name]
+        self.optimizer.apply_gradients(list(zip(gradients, vars)))
         self.gradient_accumulator.reset()
 
     def _accumulate_next_gradients(self, dataset):
@@ -298,8 +301,10 @@ class TFTrainer():
         """Forwards a training example and accumulates the gradients."""
         per_example_loss = self._run_model(features, labels, True)
         loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=self.config.train_batch_size)
-        
-        gradients = self.optimizer.get_gradients(loss, self.model.trainable_variables)
+        vars = self.model.trainable_variables
+        if self.config.mode == "labelling":
+            vars = [var for var in self.model.trainable_variables if "pooler" not in var.name]
+        gradients = self.optimizer.get_gradients(loss, vars)
 
         self.gradient_accumulator(gradients)
 
@@ -316,12 +321,12 @@ class TFTrainer():
             logits = self.model(features, training=training)[0]
         else:
             logits = self.mode(features, training=training)
-        """
+
         if self.config.mode == "labelling":
             active_loss = tf.reshape(labels, (-1,)) != -1
-            logits = tf.boolean_mask(tf.reshape(logits, (-1, len(labels))), active_loss)
+            logits = tf.boolean_mask(tf.reshape(logits, (-1, len(self.dataset_info.labels))), active_loss)
             labels = tf.boolean_mask(tf.reshape(labels, (-1,)), active_loss)
-        """
+
         loss = self.loss(labels, logits)
 
         if training:
