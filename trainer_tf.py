@@ -22,7 +22,7 @@ from configuration_trainer import TrainerConfig
 logger = logging.getLogger(__name__)
 
 
-class TFTrainer():
+class TFTrainer:
     def __init__(self, config_path: str = None, config: TrainerConfig = None, **kwargs):
         """
         The list of keys in kwargs here should be generic to all the possible models/architectures
@@ -40,7 +40,7 @@ class TFTrainer():
         else:
             raise ValueError("the config_path and config parameters cannot be both filled or None.")
 
-        self.strategy_name: bool = unused_kwargs.pop("strategy_name", "onedevice")
+        self.strategy_name: str = unused_kwargs.pop("strategy_name", "onedevice")
         self.data_processor_config: Dict = unused_kwargs.pop("data_processor", None)
 
         assert len(unused_kwargs) == 0, "unrecognized params passed: %s" % ",".join(unused_kwargs.keys())
