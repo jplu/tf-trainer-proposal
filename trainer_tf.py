@@ -334,7 +334,7 @@ class TFTrainer():
         if self.config.mode == "classification" or self.config.mode == "labelling":
             logits = self.model(features, training=training)[0]
         else:
-            logits = self.mode(features, training=training)
+            logits = self.model(features, training=training)
 
         if self.config.mode == "labelling":
             active_loss = tf.reshape(labels, (-1,)) != -1
