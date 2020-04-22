@@ -231,7 +231,7 @@ class TFTrainer():
         tf.summary.experimental.set_step(iterations)
 
         for epoch in range(1, self.config.epochs + 1):
-            for training_loss in self._training_steps(self.datasets["train"]):
+            for training_loss in self._training_steps():
                 step = iterations.numpy()
                 training_loss = tf.reduce_mean(training_loss)
 
@@ -260,7 +260,7 @@ class TFTrainer():
             self.train_acc_metric.reset_states()
             self.test_acc_metric.reset_states()
 
-    def _training_steps(self, dataset):
+    def _training_steps(self):
         """
         Returns a generator over training steps (i.e. parameters update).
         Args:
@@ -268,7 +268,7 @@ class TFTrainer():
         Returns:
           A generator that yields a loss value to report for this step.
         """
-        for i, loss in enumerate(self._accumulate_next_gradients(dataset)):
+        for i, loss in enumerate(self._accumulate_next_gradients()):
             if i % self.accum_steps == 0:
                 self._apply_gradients()
                 yield loss
@@ -289,9 +289,9 @@ class TFTrainer():
         self.optimizer.apply_gradients(list(zip(gradients, vars)))
         self.gradient_accumulator.reset()
 
-    def _accumulate_next_gradients(self, dataset):
+    def _accumulate_next_gradients(self):
         """Accumulates the gradients from the next element in dataset."""
-        iterator = iter(dataset)
+        iterator = iter(self.datasets["train"])
 
         @tf.function
         def _accumulate_next():
