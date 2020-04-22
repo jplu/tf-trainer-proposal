@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 TRAINER_CONFIG_NAME = "trainer_config.json"
 
 
-class TrainerConfig(object):
+class TrainerConfig:
     def __init__(self, **kwargs):
         self.pretrained_model_name_or_path: str = kwargs.pop("pretrained_model_name_or_path", None)
         self.optimizer_name: str = kwargs.pop("optimizer_name", None)
