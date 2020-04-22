@@ -257,7 +257,6 @@ class TFTrainer():
             logger.info("Epoch {} Step {} Train Loss {:.4f} Train Accuracy {:.4f}".format(epoch, step, training_loss.numpy(), self.train_acc_metric.result()))
             logger.info("Epoch {} Validation Loss {:.4f} Validation Accuracy {:.4f}".format(epoch, test_loss.numpy(), self.test_acc_metric.result()))
 
-        if epoch != self.epochs:
             self.train_acc_metric.reset_states()
             self.test_acc_metric.reset_states()
 
