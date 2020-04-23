@@ -1,17 +1,22 @@
 # coding=utf-8
 """Data processors per task"""
 
-import logging
-from abc import ABC, abstractmethod
-from typing import Dict, List
 import csv
 import json
+import logging
 import os
+from abc import ABC, abstractmethod
 from collections import OrderedDict
+from typing import Any, Dict, List
 
-from transformers import InputExample, InputFeatures
-from transformers import PreTrainedTokenizer, AutoTokenizer
-from transformers import is_tf_available, is_torch_available
+from transformers import (
+    AutoTokenizer,
+    InputExample,
+    InputFeatures,
+    PreTrainedTokenizer,
+    is_tf_available,
+    is_torch_available,
+)
 
 
 # Move to src/transformers/data/__init__.py
@@ -72,13 +77,13 @@ class DataProcessor(ABC):
         self.files["train"] = config.pop("train_file", None)
         self.files["validation"] = config.pop("dev_file", None)
         self.files["test"] = config.pop("test_file", None)
-        self.max_len: int = config.pop("max_len", None)
+        self.max_seq_length: int = config.pop("max_seq_length", None)
         self.format = config.pop("format", None)
         self.skip_first_row: bool = config.pop("skip_first_row", False)
         self.delimiter: str = config.pop("delimiter", "\t")
         self.quotechar: str = config.pop("quotechar", None)
 
-        assert len(config) == 0, "unrecognized params passed: %s" % ",".join(config.keys())
+        # assert len(config) == 0, "unrecognized params passed: %s" % ",".join(config.keys())
 
     @abstractmethod
     def _read_csv_and_create_examples(self, mode):
@@ -114,31 +119,30 @@ class DataProcessor(ABC):
         """
         pass
 
-    def preprocess_data(self, data_cache_dir: str, model_cache_dir: str, task: str, pretrained_model_name_or_path: str, return_dataset: str = "tf"):
+    def preprocess_data(self, args: Any, tokenizer: PreTrainedTokenizer, return_dataset: str = "tf"):
         """
         Preprocess the training and validation data.
         Args:
           cache_dir: the directory path where the cached data are / should be saved.
         """
         cached_training_features_file = os.path.join(
-            data_cache_dir, "cached_train_{}_{}_{}.{}_record".format(
-                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len), return_dataset
+            args.data_dir, "cached_train_{}_{}_{}.{}_record".format(
+                args.task_name.replace("/", "-"), tokenizer.__class__.__name__, args.max_seq_length, return_dataset
             ),
         )
         cached_validation_features_file = os.path.join(
-            data_cache_dir, "cached_validation_{}_{}_{}.{}_record".format(
-                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len), return_dataset
+            args.data_dir, "cached_validation_{}_{}_{}.{}_record".format(
+                args.task_name.replace("/", "-"), tokenizer.__class__.__name__, args.max_seq_length, return_dataset
             ),
         )
         cached_test_features_file = os.path.join(
-            data_cache_dir, "cached_test_{}_{}_{}.{}_record".format(
-                task.replace("/", "-"), list(filter(None, pretrained_model_name_or_path.split("/"))).pop(), str(self.max_len), return_dataset
+            args.data_dir, "cached_test_{}_{}_{}.{}_record".format(
+                args.task_name.replace("/", "-"), tokenizer.__class__.__name__, args.max_seq_length, return_dataset
             ),
         )
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, cache_dir=model_cache_dir, use_fast=True)
         datasets = {}
 
-        os.makedirs(data_cache_dir, exist_ok=True)
+        os.makedirs(args.data_dir, exist_ok=True)
 
         if os.path.exists(cached_training_features_file):
             logger.info("Loading features from cached file %s", cached_training_features_file)
@@ -168,14 +172,14 @@ class DataProcessor(ABC):
 
             self._cache_dataset(cached_test_features_file, datasets["test"], input_dataset=return_dataset)
 
-        if DatasetInfo.exists(data_cache_dir):
-            dataset_info = DatasetInfo.load(data_cache_dir)
+        if DatasetInfo.exists(args.data_dir):
+            dataset_info = DatasetInfo.load(args.data_dir)
         else:
             dataset_info = DatasetInfo(self.labels, {k: len(v) for k, v in self.examples.items()})
 
-            dataset_info.save(data_cache_dir)
+            dataset_info.save(args.data_dir)
 
-        return datasets, dataset_info, tokenizer
+        return datasets, dataset_info
 
     def create_examples(self, mode):
         if self.format == "csv":
@@ -326,9 +330,9 @@ class DataProcessorForSequenceClassification(DataProcessor):
             import tensorflow as tf
 
             name_to_features = {
-                "input_ids": tf.io.FixedLenFeature([self.max_len], tf.int64),
-                "attention_mask": tf.io.FixedLenFeature([self.max_len], tf.int64),
-                "token_type_ids": tf.io.FixedLenFeature([self.max_len], tf.int64),
+                "input_ids": tf.io.FixedLenFeature([self.max_seq_length], tf.int64),
+                "attention_mask": tf.io.FixedLenFeature([self.max_seq_length], tf.int64),
+                "token_type_ids": tf.io.FixedLenFeature([self.max_seq_length], tf.int64),
                 "label": tf.io.FixedLenFeature([1], tf.int64),
             }
 
@@ -403,12 +407,14 @@ class DataProcessorForSequenceClassification(DataProcessor):
             if ex_index % 10000 == 0:
                 logger.info("Tokenizing example %d", ex_index)
 
-            feature = tokenizer.encode_plus(example.text_a, example.text_b, add_special_tokens=True, max_length=self.max_len, pad_to_max_length=True)
+            # This can now be done in one batch (see transformers)
+            # and will be sped up even further in the coming months.
+            feature = tokenizer.encode_plus(example.text_a, example.text_b, add_special_tokens=True, max_length=self.max_seq_length, pad_to_max_length=True)
             label = self.labels.index(example.label)
 
-            assert len(feature["input_ids"]) == self.max_len
-            assert len(feature["attention_mask"]) == self.max_len
-            assert len(feature["token_type_ids"]) == self.max_len
+            assert len(feature["input_ids"]) == self.max_seq_length
+            assert len(feature["attention_mask"]) == self.max_seq_length
+            assert len(feature["token_type_ids"]) == self.max_seq_length
 
             if ex_index < 5:
                 logger.info("*** Example ***")
@@ -544,10 +550,10 @@ class DataProcessorForTokenClassification(DataProcessor):
             import tensorflow as tf
 
             name_to_features = {
-                "input_ids": tf.io.FixedLenFeature([self.max_len], tf.int64),
-                "attention_mask": tf.io.FixedLenFeature([self.max_len], tf.int64),
-                "token_type_ids": tf.io.FixedLenFeature([self.max_len], tf.int64),
-                "label": tf.io.FixedLenFeature([self.max_len], tf.int64),
+                "input_ids": tf.io.FixedLenFeature([self.max_seq_length], tf.int64),
+                "attention_mask": tf.io.FixedLenFeature([self.max_seq_length], tf.int64),
+                "token_type_ids": tf.io.FixedLenFeature([self.max_seq_length], tf.int64),
+                "label": tf.io.FixedLenFeature([self.max_seq_length], tf.int64),
             }
 
             def _decode_record(record):
@@ -628,9 +634,9 @@ class DataProcessorForTokenClassification(DataProcessor):
 
             special_tokens_count = tokenizer.num_special_tokens_to_add()
 
-            if len(tokens) > self.max_len - 2:
-                tokens = tokens[: (self.max_len - special_tokens_count)]
-                label_ids = label_ids[: (self.max_len - special_tokens_count)]
+            if len(tokens) > self.max_seq_length - 2:
+                tokens = tokens[: (self.max_seq_length - special_tokens_count)]
+                label_ids = label_ids[: (self.max_seq_length - special_tokens_count)]
 
             tokens += [tokenizer.sep_token]
             label_ids += [-1]
@@ -641,16 +647,16 @@ class DataProcessorForTokenClassification(DataProcessor):
 
             input_ids = tokenizer.convert_tokens_to_ids(tokens)
             input_mask = [1] * len(input_ids)
-            padding_length = self.max_len - len(input_ids)
+            padding_length = self.max_seq_length - len(input_ids)
             input_ids += [tokenizer.pad_token_id] * padding_length
             input_mask += [0] * padding_length
             segment_ids += [tokenizer.pad_token_type_id] * padding_length
             label_ids += [-1] * padding_length
 
-            assert len(input_ids) == self.max_len
-            assert len(input_mask) == self.max_len
-            assert len(segment_ids) == self.max_len
-            assert len(label_ids) == self.max_len
+            assert len(input_ids) == self.max_seq_length
+            assert len(input_mask) == self.max_seq_length
+            assert len(segment_ids) == self.max_seq_length
+            assert len(label_ids) == self.max_seq_length
 
             if ex_index < 5:
                 logger.info("*** Example ***")
